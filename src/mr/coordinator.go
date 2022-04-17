@@ -1,18 +1,40 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
-
+import (
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+)
 
 type Coordinator struct {
 	// Your definitions here.
-
+	UnProcessedFiles []string
+	ProcessingFiles  []string
+	NReduce          int
 }
 
 // Your code here -- RPC handlers for the worker to call.
+func (c *Coordinator) Dispatch(args *RequestArgs, reply *ResponseArgs) error {
+	reply.NReduce = c.NReduce
+	// for test
+	if len(c.UnProcessedFiles) > 0 {
+		var filename string = c.UnProcessedFiles[0]
+		reply.Type = MAP
+		reply.Data = filename
+
+		c.UnProcessedFiles = c.UnProcessedFiles[1:]
+		c.ProcessingFiles = append(c.ProcessingFiles, filename)
+	} else {
+		reply.Type = REDUCE
+		reply.Data = "nil"
+	}
+	fmt.Printf("len of UnProcessedFiles: %v\nlen of ProcessingFiles: %v\n",
+		len(c.UnProcessedFiles), len(c.ProcessingFiles))
+	return nil
+}
 
 //
 // an example RPC handler.
@@ -23,7 +45,6 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	reply.Y = args.X + 1
 	return nil
 }
-
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -50,7 +71,6 @@ func (c *Coordinator) Done() bool {
 
 	// Your code here.
 
-
 	return ret
 }
 
@@ -63,7 +83,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	// Your code here.
-
+	c.UnProcessedFiles = files
+	c.NReduce = nReduce
 
 	c.server()
 	return &c
