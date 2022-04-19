@@ -28,22 +28,29 @@ type ExampleReply struct {
 type WorkType int
 
 const (
-	MAP    WorkType = 1
-	REDUCE WorkType = 2
+	MAP        WorkType = 1
+	REDUCE     WorkType = 2
+	ALLDONE    WorkType = 3
+	WAITAWHILE WorkType = 4
 )
 
-type RequestArgs struct {
+type DispatchArgs struct {
 }
 
-type ResponseArgs struct {
-	// task type
-	Type WorkType
-	// task number
-	Number int
-	// reduce buckets number
+type DispatchReply struct {
+	Type    WorkType
+	Number  int
 	NReduce int
-	// payload
+	Data    string
+}
+
+type ReportArgs struct {
+	Type WorkType
 	Data string
+}
+
+type ReportReply struct {
+	Result bool
 }
 
 // Cook up a unique-ish UNIX-domain socket name

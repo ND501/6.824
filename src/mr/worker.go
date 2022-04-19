@@ -10,6 +10,8 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
+	"time"
 )
 
 //
@@ -36,7 +38,7 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-func doMapTask(mapf func(string, string) []KeyValue, args ResponseArgs) int {
+func doMapTask(mapf func(string, string) []KeyValue, args DispatchReply) int {
 	// Extract the contents of file
 	filename := args.Data
 	file, err := os.Open(filename)
@@ -53,11 +55,10 @@ func doMapTask(mapf func(string, string) []KeyValue, args ResponseArgs) int {
 
 	// Execute map task
 	kva := mapf(filename, string(content))
-	log.Printf("%v records from map\n", len(kva))
+	// log.Printf("extract %v records through map\n", len(kva))
 
-	// Shuffle the kva data and write to intermedidate file
-	sort.Sort(KeyValueSlice(kva))
 	prefix := "mr-" + strconv.Itoa(args.Number) + "-"
+	renameMap := map[string]string{}
 
 	i := 0
 	for i < len(kva) {
@@ -69,47 +70,57 @@ func doMapTask(mapf func(string, string) []KeyValue, args ResponseArgs) int {
 		intermedidate := kva[i:j]
 
 		// Write to file
-		new_filename := prefix + strconv.Itoa(ihash(intermedidate[0].Key)%args.NReduce)
-		ofile, err := os.OpenFile(new_filename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
+		suffix := strconv.Itoa(ihash(intermedidate[0].Key) % args.NReduce)
+		// ofile, err := ioutil.TempFile("./", "*.temp")
+		ofile, err := os.OpenFile("TEMP-"+prefix+suffix+".temp",
+			os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
 		if err != nil {
-			log.Fatalf("cannot open %v", new_filename)
+			log.Fatalf("cannot open %v", ofile.Name())
 			return -1
 		}
+		renameMap[ofile.Name()] = prefix + suffix
+
 		enc := json.NewEncoder(ofile)
 		for _, kv := range intermedidate {
 			err := enc.Encode(&kv)
 			if err != nil {
-				log.Fatalf("cannot write to %v", new_filename)
+				log.Fatalf("cannot write to %v", ofile.Name())
 				return -1
 			}
 		}
 		ofile.Close()
-		log.Printf("write %v [%v] records to %v\n",
-			len(intermedidate), intermedidate[0].Key, new_filename)
 
 		i = j
 	}
 
 	// Notify the coordinator that map task done
-	// TODO: to be finished
-
-	return 0
+	repArgs := ReportArgs{}
+	repArgs.Type = MAP
+	repArgs.Data = args.Data
+	repReply := ReportReply{}
+	ok := call("Coordinator.Report", &repArgs, &repReply)
+	if ok && repReply.Result {
+		// Rename temp file to intermedidate file
+		for oldname, newname := range renameMap {
+			os.Rename(oldname, newname)
+		}
+		return 0
+	} else {
+		return -1
+	}
 }
 
-func doReduceTask(reducef func(string, []string) string, args ResponseArgs) int {
-	// Wait for all map tasks finished
-	// TODO: to be finished
-
+func doReduceTask(reducef func(string, []string) string, args DispatchReply) int {
 	result := []string{}
 	content := []KeyValue{}
 
 	// For each intermedidate file in current path
 	files, _ := ioutil.ReadDir("./")
+	count := 0
 	for _, f := range files {
 		filename := f.Name()
-		if filename[len(filename)-1] == uint8('0'+args.Number) {
-			log.Printf("parsing %v", filename)
-
+		if strings.HasPrefix(filename, "mr-") && strings.HasSuffix(filename, args.Data) {
+			count++
 			// Read file and extract content
 			file, err := os.Open(filename)
 			if err != nil {
@@ -126,43 +137,59 @@ func doReduceTask(reducef func(string, []string) string, args ResponseArgs) int 
 				temp_content = append(temp_content, kv)
 			}
 			content = append(content, temp_content...)
-			log.Printf("extract %v records from %v, %v in all",
-				len(temp_content), filename, len(content))
-
-			// Execute reduce task
-			i := 0
-			for i < len(content) {
-				j := i + 1
-				for j < len(content) && content[j].Key == content[i].Key {
-					j++
-				}
-				values := []string{}
-				for k := i; k < j; k++ {
-					values = append(values, content[k].Value)
-				}
-				output := reducef(content[i].Key, values)
-				result = append(result, fmt.Sprintf("%v %v", content[i].Key, output))
-				i = j
-			}
-
 			file.Close()
 		}
+	}
+	// log.Printf("extract %v records from %v files", len(content), count)
+
+	// Shuffle content
+	sort.Sort(KeyValueSlice(content))
+
+	// Execute reduce task
+	i := 0
+	for i < len(content) {
+		j := i + 1
+		for j < len(content) && content[j].Key == content[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, content[k].Value)
+		}
+		output := reducef(content[i].Key, values)
+		result = append(result, fmt.Sprintf("%v %v", content[i].Key, output))
+		i = j
 	}
 
 	// Write to mr-out-x
 	prefix := "mr-out-"
-	new_filename := prefix + strconv.Itoa(args.Number)
-	file, err := os.Create(new_filename)
+	suffix := args.Data
+	// file, err := ioutil.TempFile("./", "*.temp")
+	file, err := os.OpenFile("TEMP-"+prefix+suffix+".temp",
+		os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
-		log.Fatalf("cannot create %v", new_filename)
+		log.Fatalf("cannot create %v", file.Name())
 		return -1
 	}
+	oldname := file.Name()
 	for _, str := range result {
 		file.WriteString(str + "\n")
 	}
 	file.Close()
 
-	return 0
+	// Notify the coordinator that map task done
+	repArgs := ReportArgs{}
+	repArgs.Type = REDUCE
+	repArgs.Data = args.Data
+	repReply := ReportReply{}
+	ok := call("Coordinator.Report", &repArgs, &repReply)
+	if ok && repReply.Result {
+		// Rename temp file to mr-out-x
+		os.Rename(oldname, prefix+suffix)
+		return 0
+	} else {
+		return -1
+	}
 }
 
 //
@@ -172,30 +199,31 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
-	args := RequestArgs{}
-	reply := ResponseArgs{}
-	ok := call("Coordinator.Dispatch", &args, &reply)
-	if ok {
-		log.Printf("reply from cooardinator: %v\n", reply)
-	} else {
-		log.Printf("call failed!\n")
-	}
+	for {
+		args := DispatchArgs{}
+		reply := DispatchReply{}
+		ok := call("Coordinator.Dispatch", &args, &reply)
+		if !ok {
+			log.Fatalln("call failed!")
+			return
+		}
+		// log.Printf("receive from coordinator: %v", reply)
 
-	switch reply.Type {
-	case MAP:
-		log.Println("Worker execute map task...")
-		ret := doMapTask(mapf, reply)
-		if ret != 0 {
-			log.Println("map task failed")
+		switch reply.Type {
+		case MAP:
+			doMapTask(mapf, reply)
+			// log.Printf("do map task: %v", reply)
+		case REDUCE:
+			doReduceTask(reducef, reply)
+			// log.Printf("do reduce task: %v", reply)
+		case WAITAWHILE:
+			time.Sleep(time.Second)
+		case ALLDONE:
+			// log.Println("Job done, return")
+			return
+		default:
+			log.Println("Error type!")
 		}
-	case REDUCE:
-		log.Println("Worker execute reduce task...")
-		ret := doReduceTask(reducef, reply)
-		if ret != 0 {
-			log.Println("reduce task failed")
-		}
-	default:
-		log.Println("Error work type!")
 	}
 
 	// uncomment to send the Example RPC to the coordinator.
