@@ -46,36 +46,42 @@ func (c *Coordinator) Init(files []string, nums int) {
 }
 
 func (c *Coordinator) AddTimer(taskname string) {
-	// TODO: 调用 AddTimer 时，taskname 有可能已经存在吗？
 	c.tp[taskname] = time.AfterFunc(10*time.Second, func() {
 		c.mutex.Lock()
-		if _, ok := c.tp[taskname]; ok {
+		defer c.mutex.Unlock()
+		if _, ok := c.tp[taskname]; !ok {
+			// Already finished, no need for processing
+			log.Printf("task %v has finished, cannot timeout", taskname)
+		} else {
+			// Task timeout, remove from c.tp and append to c.tasks
 			log.Printf("task %v time out", taskname)
 			delete(c.tp, taskname)
 			c.tasks = append(c.tasks, taskname)
 		}
-		c.mutex.Unlock()
 	})
 }
 
 func (c *Coordinator) RemoveTimer(taskname string) int {
 	c.mutex.Lock()
-	// TODO: Use defer to unlock
+	defer c.mutex.Unlock()
 	if _, ok := c.tp[taskname]; !ok {
+		// Already timeout, remove fail, return -1
 		log.Printf("task %v has time out, cannot remove timer", taskname)
 		c.mutex.Unlock()
 		return -1
-	}
-	c.tp[taskname].Stop()
-	delete(c.tp, taskname)
-	if len(c.tasks) == 0 && len(c.tp) == 0 {
-		c.ph++
-		if c.ph == PHASE_REDUCE {
-			c.PrepareForReduce()
+	} else {
+		// Remove successed, return 0
+		c.tp[taskname].Stop()
+		delete(c.tp, taskname)
+		// In below situation, push forward phase
+		if len(c.tasks) == 0 && len(c.tp) == 0 {
+			c.ph++
+			if c.ph == PHASE_REDUCE {
+				c.PrepareForReduce()
+			}
 		}
+		return 0
 	}
-	c.mutex.Unlock()
-	return 0
 }
 
 // Your code here -- RPC handlers for the worker to call.

@@ -55,7 +55,6 @@ func doMapTask(mapf func(string, string) []KeyValue, args DispatchReply) int {
 
 	// Execute map task
 	kva := mapf(filename, string(content))
-	// log.Printf("extract %v records through map\n", len(kva))
 
 	prefix := "mr-" + strconv.Itoa(args.Number) + "-"
 	renameMap := map[string]string{}
@@ -71,7 +70,6 @@ func doMapTask(mapf func(string, string) []KeyValue, args DispatchReply) int {
 
 		// Write to file
 		suffix := strconv.Itoa(ihash(intermedidate[0].Key) % args.NReduce)
-		// ofile, err := ioutil.TempFile("./", "*.temp")
 		ofile, err := os.OpenFile("TEMP-"+prefix+suffix+".temp",
 			os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
 		if err != nil {
@@ -106,6 +104,7 @@ func doMapTask(mapf func(string, string) []KeyValue, args DispatchReply) int {
 		}
 		return 0
 	} else {
+		// TODO: Report failed, maybe remove temp file?
 		return -1
 	}
 }
@@ -116,11 +115,9 @@ func doReduceTask(reducef func(string, []string) string, args DispatchReply) int
 
 	// For each intermedidate file in current path
 	files, _ := ioutil.ReadDir("./")
-	count := 0
 	for _, f := range files {
 		filename := f.Name()
 		if strings.HasPrefix(filename, "mr-") && strings.HasSuffix(filename, args.Data) {
-			count++
 			// Read file and extract content
 			file, err := os.Open(filename)
 			if err != nil {
@@ -140,7 +137,6 @@ func doReduceTask(reducef func(string, []string) string, args DispatchReply) int
 			file.Close()
 		}
 	}
-	// log.Printf("extract %v records from %v files", len(content), count)
 
 	// Shuffle content
 	sort.Sort(KeyValueSlice(content))
@@ -164,7 +160,6 @@ func doReduceTask(reducef func(string, []string) string, args DispatchReply) int
 	// Write to mr-out-x
 	prefix := "mr-out-"
 	suffix := args.Data
-	// file, err := ioutil.TempFile("./", "*.temp")
 	file, err := os.OpenFile("TEMP-"+prefix+suffix+".temp",
 		os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
@@ -188,6 +183,7 @@ func doReduceTask(reducef func(string, []string) string, args DispatchReply) int
 		os.Rename(oldname, prefix+suffix)
 		return 0
 	} else {
+		// TODO: Report failed, maybe remove temp file?
 		return -1
 	}
 }
@@ -207,7 +203,6 @@ func Worker(mapf func(string, string) []KeyValue,
 			log.Fatalln("call failed!")
 			return
 		}
-		log.Printf("receive from coordinator: %v", reply)
 
 		switch reply.Type {
 		case MAP:
