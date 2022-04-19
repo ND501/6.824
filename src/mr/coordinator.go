@@ -19,6 +19,8 @@ const (
 	PHASE_DONE   Phase = 3
 )
 
+// Race detector will report warnings for ph, nReduce and count.
+// It will not affect the correctness of the program
 type Coordinator struct {
 	// Your definitions here.
 	tasks   []string
