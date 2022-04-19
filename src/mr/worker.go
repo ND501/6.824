@@ -207,19 +207,19 @@ func Worker(mapf func(string, string) []KeyValue,
 			log.Fatalln("call failed!")
 			return
 		}
-		// log.Printf("receive from coordinator: %v", reply)
+		log.Printf("receive from coordinator: %v", reply)
 
 		switch reply.Type {
 		case MAP:
 			doMapTask(mapf, reply)
-			// log.Printf("do map task: %v", reply)
+			log.Printf("do map task: %v", reply)
 		case REDUCE:
 			doReduceTask(reducef, reply)
-			// log.Printf("do reduce task: %v", reply)
+			log.Printf("do reduce task: %v", reply)
 		case WAITAWHILE:
 			time.Sleep(time.Second)
 		case ALLDONE:
-			// log.Println("Job done, return")
+			log.Println("Job done, return")
 			return
 		default:
 			log.Println("Error type!")

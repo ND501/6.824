@@ -11,50 +11,6 @@ import (
 	"time"
 )
 
-type TimerPool struct {
-	tChan    chan string
-	timerMap map[string]*time.Timer
-}
-
-func (tp *TimerPool) Init() {
-	tp.tChan = make(chan string)
-	tp.timerMap = make(map[string]*time.Timer)
-}
-
-func (tp *TimerPool) Add(taskname string) {
-	tp.timerMap[taskname] = time.NewTimer(10 * time.Second)
-	go func() {
-		<-tp.timerMap[taskname].C
-		tp.tChan <- taskname
-	}()
-}
-
-func (tp *TimerPool) Remove(taskname string) int {
-	if _, ok := tp.timerMap[taskname]; ok {
-		tp.timerMap[taskname].Stop()
-		delete(tp.timerMap, taskname)
-		return 0
-	}
-	return -1
-}
-
-func (tp *TimerPool) Size() int {
-	return len(tp.timerMap)
-}
-
-type RpcType int
-
-const (
-	DISPATCH RpcType = 1
-	REPORT   RpcType = 2
-	REDUCEGO RpcType = 3
-)
-
-type RpcEvent struct {
-	Type RpcType
-	Sync chan int
-}
-
 type Phase int
 
 const (
@@ -66,33 +22,60 @@ const (
 type Coordinator struct {
 	// Your definitions here.
 	tasks   []string
-	tp      TimerPool
+	tp      map[string]*time.Timer
 	ph      Phase
 	nReduce int
 	count   int
 	mutex   sync.Mutex
 }
 
+// Use PrepareForReduce to make reduce task list for coordinator.
+// Please make sure c.mutex has been locked.
+func (c *Coordinator) PrepareForReduce() {
+	for i := 0; i < c.nReduce; i++ {
+		c.tasks = append(c.tasks, strconv.Itoa(i))
+	}
+}
+
 func (c *Coordinator) Init(files []string, nums int) {
-	c.tp.Init()
+	c.tp = make(map[string]*time.Timer)
 	c.count = 0
 	c.ph = PHASE_MAP
 	c.tasks = files
 	c.nReduce = nums
 }
 
-func (c *Coordinator) Run() {
-	// log.Println("Coordinator running...")
-
-	for {
-		taskname := <-c.tp.tChan
+func (c *Coordinator) AddTimer(taskname string) {
+	// TODO: 调用 AddTimer 时，taskname 有可能已经存在吗？
+	c.tp[taskname] = time.AfterFunc(10*time.Second, func() {
 		c.mutex.Lock()
-		if c.tp.Remove(taskname) == 0 {
+		if _, ok := c.tp[taskname]; ok {
+			log.Printf("task %v time out", taskname)
+			delete(c.tp, taskname)
 			c.tasks = append(c.tasks, taskname)
-			// log.Printf("%v timeout, phase is %v", taskname, c.ph)
 		}
 		c.mutex.Unlock()
+	})
+}
+
+func (c *Coordinator) RemoveTimer(taskname string) int {
+	c.mutex.Lock()
+	// TODO: Use defer to unlock
+	if _, ok := c.tp[taskname]; !ok {
+		log.Printf("task %v has time out, cannot remove timer", taskname)
+		c.mutex.Unlock()
+		return -1
 	}
+	c.tp[taskname].Stop()
+	delete(c.tp, taskname)
+	if len(c.tasks) == 0 && len(c.tp) == 0 {
+		c.ph++
+		if c.ph == PHASE_REDUCE {
+			c.PrepareForReduce()
+		}
+	}
+	c.mutex.Unlock()
+	return 0
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -108,7 +91,7 @@ func (c *Coordinator) Dispatch(args *DispatchArgs, reply *DispatchReply) error {
 			reply.Type = MAP
 			reply.Data = c.tasks[0]
 			c.tasks = c.tasks[1:]
-			c.tp.Add(reply.Data)
+			c.AddTimer(reply.Data)
 		} else {
 			reply.Type = WAITAWHILE
 		}
@@ -117,7 +100,7 @@ func (c *Coordinator) Dispatch(args *DispatchArgs, reply *DispatchReply) error {
 			reply.Type = REDUCE
 			reply.Data = c.tasks[0]
 			c.tasks = c.tasks[1:]
-			c.tp.Add(reply.Data)
+			c.AddTimer(reply.Data)
 		} else {
 			reply.Type = WAITAWHILE
 		}
@@ -136,22 +119,9 @@ func (c *Coordinator) Report(args *ReportArgs, reply *ReportReply) error {
 		return nil
 	}
 
-	c.mutex.Lock()
-	if c.tp.Remove(args.Data) == 0 {
+	if c.RemoveTimer(args.Data) == 0 {
 		reply.Result = true
-		// log.Printf("%v report, phase is %v", args.Data, c.ph)
-		if len(c.tasks) == 0 && c.tp.Size() == 0 {
-			c.ph++
-			// log.Printf("move phase to %v", c.ph)
-			if c.ph == PHASE_REDUCE {
-				for i := 0; i < c.nReduce; i++ {
-					c.tasks = append(c.tasks, strconv.Itoa(i))
-				}
-				// log.Printf("init reduce tasks")
-			}
-		}
 	}
-	c.mutex.Unlock()
 
 	return nil
 }
@@ -207,7 +177,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	// Your code here.
 	c.Init(files, nReduce)
-	go c.Run()
+	log.Printf("Coordinator running...")
 
 	c.server()
 	return &c
