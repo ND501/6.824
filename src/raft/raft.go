@@ -136,6 +136,12 @@ func (rf *Raft) init() {
 	rf.votedFor = -1
 	rf.state = ST_FOLLOWER
 	rf.et.beginTime = time.Now()
+
+	// Set sentinel as first log at index 0
+	emptyLog := LogEntry{}
+	emptyLog.index = 0
+	emptyLog.term = 0
+	rf.log = append(rf.log, interface{}(emptyLog))
 }
 
 func (rf *Raft) initLeader() {
@@ -270,21 +276,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		logSize := len(rf.log)
-		if logSize == 0 {
+		lastLog := rf.log[len(rf.log)-1].(LogEntry)
+		if lastLog.term < args.LastLogTerm ||
+			(lastLog.term == args.LastLogTerm && lastLog.index <= args.LastLogIndex) {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
 			rf.et.reset()
-			log.Printf("[%v] vote for %v, reset timer", rf.me, args.CandidateId)
-		} else {
-			lastLog := rf.log[logSize-1].(LogEntry)
-			if lastLog.term < args.LastLogTerm ||
-				(lastLog.term == args.LastLogTerm && lastLog.index < args.LastLogIndex) {
-				reply.VoteGranted = true
-				rf.votedFor = args.CandidateId
-				rf.et.reset()
-				log.Printf("[%v] vote for %v, reset timer, log not empty", rf.me, args.CandidateId)
-			}
+			log.Printf("[%v] vote for %v, reset timer, log not empty", rf.me, args.CandidateId)
 		}
 	}
 	// Otherwise, reply.VoteGranted default to be false
@@ -412,11 +410,13 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 	args.Term = rf.currentTerm
 	args.LeaderId = rf.me
 	if !isHeartbeat {
-		args.PrevLogIndex = rf.commitIndex
+		toAppend := rf.nextIndex[server]
+		args.PrevLogIndex = toAppend - 1
+		args.PrevLogTerm = rf.log[toAppend-1].(LogEntry).term
 		// Only append one entry, not support many entries in one RPC for now
 		// TODO: support many entries
 		args.LeaderCommit = rf.commitIndex
-		args.Entries = append(args.Entries, rf.log[rf.nextIndex[server]].(LogEntry))
+		args.Entries = append(args.Entries, rf.log[toAppend].(LogEntry))
 	}
 	rf.mu.Unlock()
 
