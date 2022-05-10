@@ -29,7 +29,7 @@ import (
 	"6.824/labrpc"
 )
 
-const ELECTION_TIMEOUT time.Duration = 200 * time.Millisecond
+const ELECTION_TIMEOUT time.Duration = 300 * time.Millisecond
 
 type State int
 
@@ -68,23 +68,28 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-type ElectionTimer struct {
+type ElectionTools struct {
 	mu        sync.Mutex
 	beginTime time.Time
+	agreed    int32
+	disagreed int32
 }
 
-func (et *ElectionTimer) reset(nowTime time.Time) {
+func (et *ElectionTools) reset() {
 	et.mu.Lock()
 	defer et.mu.Unlock()
-	et.beginTime = nowTime
+
+	et.beginTime = time.Now()
 }
 
-func (et *ElectionTimer) timeout() bool {
+func (et *ElectionTools) timeout() bool {
 	et.mu.Lock()
 	defer et.mu.Unlock()
 
 	nowTime := time.Now()
-	if nowTime.Sub(et.beginTime) >= ELECTION_TIMEOUT {
+	// Random timeout range at [300, 600]
+	randTimeOut := time.Duration(rand.Intn(300)+300) * time.Millisecond
+	if nowTime.Sub(et.beginTime) >= randTimeOut {
 		return true
 	} else {
 		return false
@@ -116,12 +121,12 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	et    ElectionTimer
+	et    ElectionTools
 	state State
 
-	leaderRunning   int32
-	electionRunning int32
-	voteCount       int32
+	leaderRunning int32
+	// TODO: maybe add a LeaderID variable, in case the client request send to follower
+	//       and follower don't know where to redirect the request.
 }
 
 func (rf *Raft) init() {
@@ -131,6 +136,18 @@ func (rf *Raft) init() {
 	rf.votedFor = -1
 	rf.state = ST_FOLLOWER
 	rf.et.beginTime = time.Now()
+}
+
+func (rf *Raft) initLeader() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	atomic.StoreInt32(&rf.leaderRunning, 1)
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = rf.commitIndex
+	}
 }
 
 // return currentTerm and whether this server
@@ -237,7 +254,6 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	// log.Printf("[%v] handle RequestVote from %v", rf.me, args)
 	rf.mu.Lock()
 	reply.Term = rf.currentTerm
 	// Update currentTerm and vote
@@ -245,8 +261,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		if rf.state == ST_LEADER || rf.state == ST_CANDIDATE {
-			log.Printf("[%v] degenerate from %v to follower", rf.me, rf.state)
+			log.Printf(
+				"[%v] handle RequestVote, newer term %v from [%v], convert to follower from %v",
+				rf.me, args.Term, args.CandidateId, rf.state,
+			)
 			rf.state = ST_FOLLOWER
+			atomic.StoreInt32(&rf.leaderRunning, 0)
 		}
 	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
@@ -254,7 +274,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if logSize == 0 {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
-			rf.et.reset(time.Now())
+			rf.et.reset()
 			log.Printf("[%v] vote for %v, reset timer", rf.me, args.CandidateId)
 		} else {
 			lastLog := rf.log[logSize-1].(LogEntry)
@@ -262,8 +282,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				(lastLog.term == args.LastLogTerm && lastLog.index < args.LastLogIndex) {
 				reply.VoteGranted = true
 				rf.votedFor = args.CandidateId
-				rf.et.reset(time.Now())
-				log.Printf("[%v] vote for %v, reset timer", rf.me, args.CandidateId)
+				rf.et.reset()
+				log.Printf("[%v] vote for %v, reset timer, log not empty", rf.me, args.CandidateId)
 			}
 		}
 	}
@@ -321,44 +341,118 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	if len(args.Entries) == 0 &&
-		rf.state == ST_CANDIDATE &&
-		rf.currentTerm <= reply.Term {
-		// Reset timer when received valid AppendEntries or heartbeat
-		rf.et.reset(time.Now())
-		// Set electionRunning to 0
-		atomic.StoreInt32(&rf.electionRunning, 0)
-		// Convert to follower
-		rf.state = ST_FOLLOWER
-		log.Printf("[%v] received AppendEntries when electing, convert to follower", rf.me)
-	}
+	defer rf.mu.Unlock()
+
 	reply.Term = rf.currentTerm
-	reply.Success = false
-	rf.mu.Unlock()
+	if rf.currentTerm > reply.Term {
+		// Out-of-date request, do noting and return
+		return
+	} else if rf.currentTerm < reply.Term {
+		// Update currentTerm, set votedFor to -1
+		rf.currentTerm = reply.Term
+		rf.votedFor = -1
+	}
+
+	// Received request from current leader, reset timer
+	rf.et.reset()
+
+	// When candidate received valid AppendEntries, stop election
+	if rf.state == ST_CANDIDATE {
+		rf.state = ST_FOLLOWER
+		log.Printf(
+			"[%v] handle AppendEntries, from [%v], electing now, convert to follower",
+			rf.me, args.LeaderId,
+		)
+	}
+
+	// Handle AppendEntries
+	if len(args.Entries) == 1 {
+		// If log doesn't contain an entry at PrevLogIndex with PrevLogTerm, append failed
+		if len(rf.log)-1 < args.PrevLogIndex ||
+			rf.log[args.PrevLogIndex].(LogEntry).term != args.PrevLogTerm {
+			log.Printf(
+				"[%v] handle AppendEntries, append failed, not contain prev log "+
+					"at index %v with term %v",
+				rf.me, args.PrevLogIndex, args.PrevLogTerm,
+			)
+			return
+		}
+		newEntry := args.Entries[0].(LogEntry)
+		// If log contain entry at new entry's index with different term, delete them all
+		if len(rf.log)-1 >= newEntry.index &&
+			rf.log[newEntry.index].(LogEntry).term != args.Term {
+			rf.log = rf.log[:args.PrevLogIndex+1]
+			log.Printf(
+				"[%v] handle AppendEntries, delete %v conflict logs",
+				rf.me, len(rf.log)-newEntry.index,
+			)
+		}
+		// Append new entry and set reply.Success to true
+		rf.log = append(rf.log, newEntry)
+		reply.Success = true
+		log.Printf(
+			"[%v] handle AppendEntries, append successed with %+v",
+			rf.me, newEntry,
+		)
+	} else if len(args.Entries) > 1 {
+		log.Printf(
+			"[%v] handle AppendEntries, from [%v], many entries, not supported",
+			rf.me, args.LeaderId,
+		)
+	}
+	// Otherwise, reply.Success is false
 }
 
-func (rf *Raft) sendHeartBeat(server int) {
-	// Send heartbeat to server
+func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
+	// TODO: to be continue
 	args := AppendEntriesArgs{}
 	reply := AppendEntriesReply{}
+	// Fill in arguments
+	rf.mu.Lock()
+	args.Term = rf.currentTerm
+	args.LeaderId = rf.me
+	if !isHeartbeat {
+		args.PrevLogIndex = rf.commitIndex
+		// Only append one entry, not support many entries in one RPC for now
+		// TODO: support many entries
+		args.LeaderCommit = rf.commitIndex
+		args.Entries = append(args.Entries, rf.log[rf.nextIndex[server]].(LogEntry))
+	}
+	rf.mu.Unlock()
+
 	rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
 
-	// Update currentTerm and leaderRunning when needed
+	// Handle reply and lock mutex
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if reply.Term > rf.currentTerm {
+		// Stop leader process and convert to follower when received newer term
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
 		atomic.StoreInt32(&rf.leaderRunning, 0)
+		log.Printf(
+			"[%v] send AppendEntries, newer term %v from [%v], convert to follower from %v",
+			rf.me, reply.Term, server, rf.state,
+		)
 		rf.state = ST_FOLLOWER
-		log.Printf("[%v] received newer term from [%v] with %v, degenerate to follower",
-			rf.me, server, reply.Term)
+	} else if reply.Success {
+		// Increase nextIndex and matchIndex when successed
+		rf.nextIndex[server]++
+		rf.matchIndex[server]++
+	} else if !isHeartbeat {
+		// Decrease nextIndex and retry when failed
+		rf.nextIndex[server]--
+		log.Printf("[%v] send AppendEntries, failed with index %v, try again",
+			rf.me, args.Entries[0].(LogEntry).index,
+		)
+		go rf.sendAppendEntries(server, false)
 	}
-	rf.mu.Unlock()
+	// Heartbeat will return false, but no need to handle
 }
 
 func (rf *Raft) StartLeaderProcess() {
-	// Set leaderRunning to 1 in atomic way
-	atomic.StoreInt32(&rf.leaderRunning, 1)
+	// Init for leader
+	rf.initLeader()
 	log.Printf("[%v] start leader process", rf.me)
 
 	for {
@@ -369,14 +463,14 @@ func (rf *Raft) StartLeaderProcess() {
 		// Send heartbeats to each peer
 		for server := range rf.peers {
 			if server != rf.me {
-				go rf.sendHeartBeat(server)
+				go rf.sendAppendEntries(server, true)
 			}
 		}
-		// Sleep for 100 milliseconds
-		time.Sleep(100 * time.Millisecond)
+		// Sleep for 150 milliseconds
+		time.Sleep(150 * time.Millisecond)
 	}
 
-	log.Printf("[%v] quit leaderProcess", rf.me)
+	log.Printf("[%v] stop leader process", rf.me)
 }
 
 func (rf *Raft) sendRequestVote(server int) {
@@ -387,70 +481,87 @@ func (rf *Raft) sendRequestVote(server int) {
 	rf.mu.Lock()
 	args.Term = rf.currentTerm
 	rf.mu.Unlock()
+
 	rf.peers[server].Call("Raft.RequestVote", &args, &reply)
 
 	// Check vote result
 	rf.mu.Lock()
-	if reply.VoteGranted {
-		// Atomic add voteCount
-		atomic.AddInt32(&rf.voteCount, 1)
-		if atomic.LoadInt32(&rf.voteCount) > int32((len(rf.peers)>>1)) &&
-			rf.state != ST_LEADER {
-			// Convert to leader and start leaderProcess
+	defer rf.mu.Unlock()
+	if reply.Term > rf.currentTerm {
+		// Stop election, convert to follower
+		rf.state = ST_FOLLOWER
+		log.Printf(
+			"[%v] send RequestVote, newer term %v from [%v], lose election",
+			rf.me, reply.Term, server,
+		)
+	} else if reply.VoteGranted {
+		// Update agreed votes
+		atomic.AddInt32(&rf.et.agreed, 1)
+		if atomic.LoadInt32(&rf.et.agreed) > int32((len(rf.peers)>>1)) &&
+			rf.state == ST_CANDIDATE {
+			// Win election, convert to leader and start leaderProcess
 			rf.state = ST_LEADER
 			go rf.StartLeaderProcess()
-			// Stop election because already win
-			atomic.StoreInt32(&rf.electionRunning, 0)
-			log.Printf("[%v] win election with term %v", rf.me, rf.currentTerm)
+			log.Printf(
+				"[%v] send RequestVote, win election with term %v",
+				rf.me, rf.currentTerm,
+			)
 		}
-	} else if reply.Term >= rf.currentTerm {
-		// Convert to follower and stop election
-		rf.state = ST_FOLLOWER
-		atomic.StoreInt32(&rf.electionRunning, 0)
-		log.Printf("[%v] lose election because newer term %v", rf.me, reply.Term)
+	} else {
+		// Update disagreed votes
+		atomic.AddInt32(&rf.et.disagreed, 1)
+		if atomic.LoadInt32(&rf.et.disagreed) > int32(len(rf.peers)>>1) &&
+			rf.state == ST_CANDIDATE {
+			// Lose election, convert to follower
+			rf.state = ST_FOLLOWER
+			log.Printf(
+				"[%v] send RequestVote, majority disagree, lose election",
+				rf.me,
+			)
+		}
 	}
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) StartElection() {
 	rf.mu.Lock()
-	// Set electionRunning to 1 and vote to self
-	atomic.StoreInt32(&rf.electionRunning, 1)
 	rf.votedFor = rf.me
-	atomic.StoreInt32(&rf.voteCount, 1)
+	atomic.StoreInt32(&rf.et.agreed, 1)
+	atomic.StoreInt32(&rf.et.disagreed, 0)
 	// Convert to candidate and increase currentTerm
 	rf.state = ST_CANDIDATE
 	rf.currentTerm++
-	log.Printf("[%v] start new election with term %v, reset timer", rf.me, rf.currentTerm)
+	log.Printf("[%v] start election with term %v", rf.me, rf.currentTerm)
 	rf.mu.Unlock()
 
 	// Call RequestVote to each peers
 	for server := range rf.peers {
-		if server != rf.me && atomic.LoadInt32(&rf.electionRunning) == 1 {
+		if server != rf.me {
 			go rf.sendRequestVote(server)
 		}
 	}
 
-	// Wait for election result or timeout
-	// TODO: set timeout to be 400 ms, maybe incorrect
+	// Wait for election result or 300 ms timeout
 	beginTime := time.Now()
 	nowTime := time.Now()
-	for nowTime.Sub(beginTime) < 400*time.Microsecond {
+	for nowTime.Sub(beginTime) < 300*time.Millisecond {
+		// Case 1, newer term or majority decision shutdown the election
 		rf.mu.Lock()
-		if rf.state == ST_LEADER {
+		if rf.state != ST_CANDIDATE {
 			rf.mu.Unlock()
 			return
 		}
 		rf.mu.Unlock()
-		time.Sleep(50 * time.Microsecond)
+		time.Sleep(50 * time.Millisecond)
 		nowTime = time.Now()
 	}
-	// Convert to follower and set electionRunning to 0
+	// Case 2, election timeout, clear votes to invalidate subsequent votes
+	atomic.StoreInt32(&rf.et.agreed, 0)
+	atomic.StoreInt32(&rf.et.disagreed, 0)
 	rf.mu.Lock()
 	rf.state = ST_FOLLOWER
-	atomic.StoreInt32(&rf.electionRunning, 0)
 	rf.mu.Unlock()
-	log.Printf("[%v] lose election because timeout", rf.me)
+
+	log.Printf("[%v] lose election, timeout", rf.me)
 }
 
 //
@@ -511,13 +622,10 @@ func (rf *Raft) ticker() {
 		nowState := rf.state
 		rf.mu.Unlock()
 		if nowState == ST_FOLLOWER && rf.et.timeout() {
-			log.Printf("[%v] election timeout", rf.me)
-			rf.et.reset(time.Now())
+			rf.et.reset()
 			go rf.StartElection()
 		} else {
-			// TODO: set to 200-400 ms, maybe not correct
-			sleepFor := 200 + rand.Intn(200)
-			time.Sleep(time.Duration(sleepFor) * time.Millisecond)
+			time.Sleep(25 * time.Millisecond)
 		}
 	}
 	log.Printf("[%v] is killed\n", rf.me)
