@@ -539,7 +539,9 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 		)
 	} else if !isHeartbeat {
 		// If failed because of inconsistency, decrease nextIndex and retry
-		if !reply.AlreadyExist && rf.nextIndex[server] > 1 {
+		if !reply.AlreadyExist &&
+			rf.nextIndex[server] > 1 &&
+			rf.nextIndex[server] == args.Entries[0].Index {
 			rf.nextIndex[server]--
 			log.Printf("[%v] send AppendEntries to [%v], failed with index %v, try again",
 				rf.me, server, args.Entries[0].Index,
