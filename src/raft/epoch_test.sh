@@ -1,10 +1,10 @@
 #! /bin/bash
 
-test_name="2A"
-epoch=$1
+test_name=$1
+epoch=$2
 output="test_log"
 
-echo "run test ${test_name} for epoch $1"
+echo "run test ${test_name} for epoch ${epoch}"
 
 if [ ! -d "./${output}" ]
 then

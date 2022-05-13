@@ -142,8 +142,6 @@ type Raft struct {
 	state         State
 	applyCh       chan ApplyMsg
 	leaderRunning int32
-	// TODO: maybe add a LeaderID variable, in case the client request send to follower
-	//       and follower don't know where to redirect the request.
 }
 
 func (rf *Raft) init(applyCh chan ApplyMsg) {
@@ -375,9 +373,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		)
 		return
 	} else if rf.currentTerm < args.Term {
-		// Update currentTerm, set votedFor to -1
+		// Update currentTerm, set votedFor to null (-1)
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
+		if rf.state != ST_FOLLOWER {
+			log.Printf(
+				"[%v] received AppendEntries from [%v], "+
+					"newer term with %v, convert to follower",
+				rf.me, args.LeaderId, args.Term,
+			)
+			// When stray leader get back, may received AppendEntries with newer term
+			if rf.state == ST_LEADER {
+				atomic.StoreInt32(&rf.leaderRunning, 0)
+			}
+			rf.state = ST_FOLLOWER
+		}
 	}
 
 	// Received request from current leader, reset timer
@@ -433,7 +443,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Update commitIndex
 	oldCommitIndex := rf.commitIndex
 	if rf.commitIndex < args.LeaderCommit {
-		// TODO: need to handle many entries in one RPC
+		// TODO: support many entries in one RPC
 		rf.commitIndex = MinInt(args.LeaderCommit, len(rf.log)-1)
 		log.Printf("[%v] set commitIndex from %v to %v", rf.me, oldCommitIndex, rf.commitIndex)
 	}
@@ -447,8 +457,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			msg.Command = rf.log[rf.lastApplied].Command
 			msg.CommandIndex = rf.log[rf.lastApplied].Index
 			rf.applyCh <- msg
-			// TODO: apply it to state machine, maybe this branch should placed to another place
-			log.Printf("[%v] applied %+v", rf.me, rf.log[rf.lastApplied])
+			log.Printf(
+				"[%v] applied %+v, log length %v",
+				rf.me, rf.log[rf.lastApplied], len(rf.log),
+			)
 		}
 	}
 }
@@ -488,8 +500,7 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 		toAppend := rf.nextIndex[server]
 		args.PrevLogIndex = toAppend - 1
 		args.PrevLogTerm = rf.log[toAppend-1].Term
-		// Only append one entry, not support many entries in one RPC for now
-		// TODO: support many entries
+		// TODO: Only append one entry, not support many entries in one RPC for now
 		args.Entries = append(args.Entries, rf.log[toAppend])
 	}
 	rf.mu.Unlock()
@@ -550,7 +561,10 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 				msg.Command = rf.log[rf.lastApplied].Command
 				msg.CommandIndex = rf.log[rf.lastApplied].Index
 				rf.applyCh <- msg
-				log.Printf("[%v] applied %+v", rf.me, rf.log[rf.lastApplied])
+				log.Printf(
+					"[%v] applied %+v, log length %v",
+					rf.me, rf.log[rf.lastApplied], len(rf.log),
+				)
 			}
 		}
 		log.Printf(
@@ -595,8 +609,8 @@ func (rf *Raft) StartLeaderProcess() {
 				go rf.sendAppendEntries(server, false)
 			}
 		}
-		// Sleep for 150 milliseconds
-		time.Sleep(150 * time.Millisecond)
+		// Sleep for 100 milliseconds
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	log.Printf("[%v] stop leader process", rf.me)
@@ -731,7 +745,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	rf.mu.Lock()
-	// server is not leader, or leader init not finished
+	// If server is not leader, or leader init not finished, return false
 	if rf.state != ST_LEADER || atomic.LoadInt32(&rf.leaderRunning) == 0 {
 		rf.mu.Unlock()
 		return index, term, false
@@ -742,13 +756,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	newEntry.Command = command
 	rf.log = append(rf.log, newEntry)
 	rf.mu.Unlock()
-
-	// Call AppendEntries to each server
-	for server := range rf.peers {
-		if server != rf.me {
-			go rf.sendAppendEntries(server, false)
-		}
-	}
 
 	log.Printf(
 		"[%v] Call Start, append {index: %v, term: %v, cmd: %v}",
@@ -772,7 +779,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	atomic.StoreInt32(&rf.leaderRunning, 0)
 	atomic.StoreInt32(&rf.leaderRunning, 0)
 }
 
