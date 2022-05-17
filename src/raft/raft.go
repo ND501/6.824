@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	//	"bytes"
 	"bytes"
 	"log"
 	"math/rand"
@@ -27,12 +26,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
 	"6.824/labgob"
 	"6.824/labrpc"
 )
-
-const ELECTION_TIMEOUT time.Duration = 300 * time.Millisecond
 
 type State int
 
@@ -106,8 +102,8 @@ func (et *ElectionTools) timeout() bool {
 	defer et.mu.Unlock()
 
 	nowTime := time.Now()
-	// Random timeout range at [300, 600]
-	randTimeOut := time.Duration(rand.Intn(300)+300) * time.Millisecond
+	// Random timeout range at [200, 400]
+	randTimeOut := time.Duration(rand.Intn(200)+200) * time.Millisecond
 	if nowTime.Sub(et.beginTime) >= randTimeOut {
 		return true
 	} else {
@@ -329,6 +325,21 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	// Args to support fast backup
+	XTerm  int
+	XIndex int
+	XLen   int
+}
+
+// Make sure that mutex is got before call this function
+func (rf *Raft) findFirstIndexInTermX(term int) int {
+	// Can be optimised with dichotomous search
+	for k, _ := range rf.Log {
+		if rf.Log[k].Term == term {
+			return k
+		}
+	}
+	return -1
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -375,49 +386,50 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// Check for prev log
-	if len(rf.Log)-1 < args.PrevLogIndex ||
-		rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if len(rf.Log)-1 < args.PrevLogIndex {
+		// Conflict arise, missing prev log, record XLen to AppendEntriesReply
+		reply.XTerm = -1
+		reply.XIndex = -1
+		reply.XLen = args.PrevLogIndex - (len(rf.Log) - 1)
 		log.Printf(
-			"[%v] append failed, not contain prev log at index %v with term %v",
+			"[%v] append failed, missing prev log at index %v",
+			rf.me, args.PrevLogIndex,
+		)
+		return
+	} else if rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// Conflict arise, different prev log, record XTerm and XIndex to AppendEntriesReply
+		reply.XTerm = rf.Log[args.PrevLogIndex].Term
+		reply.XIndex = rf.findFirstIndexInTermX(reply.XTerm)
+		reply.XLen = -1
+		log.Printf(
+			"[%v] append failed, different prev log at index %v with term %v",
 			rf.me, args.PrevLogIndex, args.PrevLogTerm,
 		)
 		return
 	}
 
-	// Handle AppendEntries
-	if len(args.Entries) == 1 {
+	// Append new entries
+	if len(args.Entries) > 0 {
 		reply.Success = true
-		// Check for current log
-		newEntry := args.Entries[0]
-		if len(rf.Log)-1 >= newEntry.Index {
-			if rf.Log[newEntry.Index].Term != newEntry.Term {
-				// Conflict with existed log, delete them all, then append
-				log.Printf(
-					"[%v] delete conflict logs from %v to %v",
-					rf.me, newEntry.Index, len(rf.Log)-1,
-				)
-				rf.Log = rf.Log[:args.PrevLogIndex+1]
-				rf.Log = append(rf.Log, newEntry)
-			} else {
-				// Already exist
-				log.Printf(
-					"[%v] already exist {index: %v, term: %v}",
-					rf.me, newEntry.Index, newEntry.Term,
-				)
-			}
-		} else {
-			rf.Log = append(rf.Log, newEntry)
+		beginIndex := args.Entries[0].Index
+		if len(rf.Log)-1 >= beginIndex {
+			log.Printf(
+				"[%v] delete logs from %v to %v",
+				rf.me, beginIndex, len(rf.Log)-1,
+			)
 		}
-	} else if len(args.Entries) > 1 {
-		log.Printf("[%v] not supported many entries in one RPC", rf.me)
+		rf.Log = append(rf.Log[:beginIndex], args.Entries...)
+		log.Printf("[%v] append successed, log size: %v", rf.me, len(rf.Log)-1)
 	}
 
 	// Update commitIndex
 	oldCommitIndex := rf.commitIndex
 	if rf.commitIndex < args.LeaderCommit {
-		// TODO: support many entries in one RPC
 		rf.commitIndex = MinInt(args.LeaderCommit, len(rf.Log)-1)
-		log.Printf("[%v] set commitIndex from %v to %v", rf.me, oldCommitIndex, rf.commitIndex)
+		log.Printf(
+			"[%v] set commitIndex from %v to %v, lastApplied is %v",
+			rf.me, oldCommitIndex, rf.commitIndex, rf.lastApplied,
+		)
 	}
 	// Update lastApplied
 	for rf.commitIndex > rf.lastApplied {
@@ -431,7 +443,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.applyCh <- msg
 			log.Printf(
 				"[%v] applied %+v, log length %v",
-				rf.me, rf.Log[rf.lastApplied], len(rf.Log),
+				rf.me, rf.Log[rf.lastApplied], len(rf.Log)-1,
 			)
 		}
 	}
@@ -472,8 +484,7 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 		toAppend := rf.nextIndex[server]
 		args.PrevLogIndex = toAppend - 1
 		args.PrevLogTerm = rf.Log[toAppend-1].Term
-		// TODO: Only append one entry, not support many entries in one RPC for now
-		args.Entries = append(args.Entries, rf.Log[toAppend])
+		args.Entries = append(args.Entries, rf.Log[toAppend:]...)
 	}
 	rf.mu.Unlock()
 
@@ -536,7 +547,7 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 				rf.applyCh <- msg
 				log.Printf(
 					"[%v] applied %+v, log length %v",
-					rf.me, rf.Log[rf.lastApplied], len(rf.Log),
+					rf.me, rf.Log[rf.lastApplied], len(rf.Log)-1,
 				)
 			}
 		}
@@ -547,11 +558,27 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 			rf.commitIndex, rf.lastApplied,
 		)
 	} else if !isHeartbeat {
-		// If failed because of inconsistency, decrease nextIndex and retry
-		rf.nextIndex[server] = MaxInt(1, rf.nextIndex[server]-1)
+		// Fail to append because of inconsistency, decrease nextIndex by reply args
+		if reply.XTerm != -1 {
+			// if rf.Log[reply.XIndex].Term == reply.XTerm {
+			// 	rf.nextIndex[server] = MaxInt(1, reply.XIndex+1)
+			// } else {
+			// 	rf.nextIndex[server] = MaxInt(1, reply.XIndex)
+			// }
+			rf.nextIndex[server] = MaxInt(1, reply.XIndex)
+		} else {
+			rf.nextIndex[server] = MaxInt(1, rf.nextIndex[server]-reply.XLen)
+		}
 		log.Printf(
-			"[%v] send AppendEntries to [%v] with %+v, failed with index %v, try again",
-			rf.me, server, args, args.Entries[0].Index,
+			"[%v] send AppendEntries to [%v] with "+
+				"{term: %v, prevIndex: %v, prevTerm: %v, entries: %v, leaderCommit: %v} "+
+				"entries from %v to %v, "+
+				"reply {XTerm: %v, XIndex: %v, XLen: %v}, "+
+				"new nextIndex is %v, try again",
+			rf.me, server, args.Term, args.PrevLogIndex, args.PrevLogTerm,
+			len(args.Entries), args.LeaderCommit, args.Entries[0].Index,
+			args.Entries[len(args.Entries)-1].Index, reply.XTerm, reply.XIndex,
+			reply.XLen, rf.nextIndex[server],
 		)
 		go rf.sendAppendEntries(server, false)
 	}
