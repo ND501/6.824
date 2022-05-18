@@ -392,8 +392,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XIndex = -1
 		reply.XLen = args.PrevLogIndex - (len(rf.Log) - 1)
 		log.Printf(
-			"[%v] append failed, missing prev log at index %v",
-			rf.me, args.PrevLogIndex,
+			"[%v] append failed, missing prev log at index %v, log size %v",
+			rf.me, args.PrevLogIndex, len(rf.Log)-1,
 		)
 		return
 	} else if rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
@@ -402,24 +402,37 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XIndex = rf.findFirstIndexInTermX(reply.XTerm)
 		reply.XLen = -1
 		log.Printf(
-			"[%v] append failed, different prev log at index %v with term %v",
-			rf.me, args.PrevLogIndex, args.PrevLogTerm,
+			"[%v] append failed, different prev log at index %v with term %v, log size %v",
+			rf.me, args.PrevLogIndex, args.PrevLogTerm, len(rf.Log)-1,
 		)
 		return
 	}
 
-	// Append new entries
+	// Handle entries
 	if len(args.Entries) > 0 {
+		// Set to `true` directly. If append success (if there are conflicting entries,
+		// deal with conflict first), it should be `true`. If entries in RPC already
+		// exist locally, leader should be notified with `true` to update `nextIndex`,
+		// so that leader can send newer log entries in next RPC.
 		reply.Success = true
-		beginIndex := args.Entries[0].Index
-		if len(rf.Log)-1 >= beginIndex {
-			log.Printf(
-				"[%v] delete logs from %v to %v",
-				rf.me, beginIndex, len(rf.Log)-1,
-			)
+		// Append entries if required
+		appendCount := 0
+		for index, entry := range args.Entries {
+			// Only needed if there is a conflict
+			if len(rf.Log)-1 < entry.Index || rf.Log[entry.Index].Term != entry.Term {
+				oldLen := len(rf.Log) - 1
+				appendCount = len(args.Entries) - index
+				rf.Log = append(rf.Log[:entry.Index], args.Entries[index:]...)
+				log.Printf(
+					"[%v] delete logs from %v to %v, append %v, log size: %v",
+					rf.me, entry.Index, oldLen, appendCount, len(rf.Log)-1,
+				)
+				break
+			}
 		}
-		rf.Log = append(rf.Log[:beginIndex], args.Entries...)
-		log.Printf("[%v] append successed, log size: %v", rf.me, len(rf.Log)-1)
+		if appendCount == 0 {
+			log.Printf("[%v] already exist logs, no need to append", rf.me)
+		}
 	}
 
 	// Update commitIndex
@@ -524,8 +537,9 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 		rf.state = ST_FOLLOWER
 	} else if reply.Success {
 		// Increase nextIndex and matchIndex when successed
-		rf.nextIndex[server] = MaxInt(rf.nextIndex[server], args.Entries[0].Index+1)
-		rf.matchIndex[server] = MaxInt(rf.matchIndex[server], args.Entries[0].Index)
+		endIndex := len(args.Entries) - 1
+		rf.nextIndex[server] = MaxInt(rf.nextIndex[server], args.Entries[endIndex].Index+1)
+		rf.matchIndex[server] = MaxInt(rf.matchIndex[server], args.Entries[endIndex].Index)
 		majorityMatch := rf.findMajorityMatch()
 		log.Printf(
 			"[%v] got majorityMatch as %v, matchIndex: %v",
@@ -560,11 +574,6 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 	} else if !isHeartbeat {
 		// Fail to append because of inconsistency, decrease nextIndex by reply args
 		if reply.XTerm != -1 {
-			// if rf.Log[reply.XIndex].Term == reply.XTerm {
-			// 	rf.nextIndex[server] = MaxInt(1, reply.XIndex+1)
-			// } else {
-			// 	rf.nextIndex[server] = MaxInt(1, reply.XIndex)
-			// }
 			rf.nextIndex[server] = MaxInt(1, reply.XIndex)
 		} else {
 			rf.nextIndex[server] = MaxInt(1, rf.nextIndex[server]-reply.XLen)
@@ -761,8 +770,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Unlock()
 
 	log.Printf(
-		"[%v] Call Start, append {index: %v, term: %v, cmd: %v}",
-		rf.me, newEntry.Index, newEntry.Term, newEntry.Command,
+		"[%v] Call Start, append {index: %v, term: %v, cmd: %v}, log size %v",
+		rf.me, newEntry.Index, newEntry.Term, newEntry.Command, len(rf.Log)-1,
 	)
 
 	return newEntry.Index, newEntry.Term, isLeader
