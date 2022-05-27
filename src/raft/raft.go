@@ -30,6 +30,15 @@ import (
 	"6.824/labrpc"
 )
 
+const RaftDebug = false
+
+func RaftDPrintf(format string, a ...interface{}) (n int, err error) {
+	if RaftDebug {
+		log.Printf(format, a...)
+	}
+	return
+}
+
 type State int
 
 const (
@@ -172,7 +181,7 @@ func (rf *Raft) initLeader() {
 	for i := range rf.matchIndex {
 		rf.matchIndex[i] = 0
 	}
-	log.Printf(
+	RaftDPrintf(
 		"[%v] start leader process with term %v, init nextIndex as %v",
 		rf.me, rf.CurrentTerm, rf.LogMax()+1,
 	)
@@ -290,7 +299,7 @@ func (rf *Raft) readPersist(data []byte) {
 		d.Decode(&Log) != nil ||
 		d.Decode(&LastSnapshotIndex) != nil ||
 		d.Decode(&LastSnapshotTerm) != nil {
-		log.Printf("Read from persist failed")
+		RaftDPrintf("Read from persist failed")
 	} else {
 		rf.CurrentTerm = CurrentTerm
 		rf.VotedFor = VotedFor
@@ -303,7 +312,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.commitIndex = rf.LastSnapshotIndex
 		rf.lastApplied = rf.LastSnapshotIndex
 	}
-	log.Printf(
+	RaftDPrintf(
 		"[%v] read from persist, Term: %v, votedFor: %v, len of Log: %v, "+
 			"LastSnapshotIndex: %v, LastSnapshotTerm: %v",
 		rf.me, CurrentTerm, VotedFor, len(Log), LastSnapshotIndex, LastSnapshotTerm,
@@ -343,7 +352,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return
 	}
 
-	log.Printf(
+	RaftDPrintf(
 		"[%v] call snapshot with index %v, current lastSnapshotIndex %v, "+
 			"lastSnapshotTerm %v, log size %v, log len %v",
 		rf.me, index, rf.LastSnapshotIndex,
@@ -375,14 +384,14 @@ func (rf *Raft) EndlessApply() {
 				Command:      entry.Command,
 				CommandIndex: entry.Index,
 			}
-			log.Printf("[%v] applied %+v", rf.me, entry)
+			RaftDPrintf("[%v] applied %+v", rf.me, entry)
 		}
 
 		// Update lastApplied
 		rf.mu.Lock()
 		rf.lastApplied = MaxInt(curCommitIndex, rf.lastApplied)
 		if len(toApply) > 0 {
-			log.Printf(
+			RaftDPrintf(
 				"[%v] applied %v entries, commitIndex at %v, lastApplied at %v, log size %v",
 				rf.me, len(toApply), rf.commitIndex, rf.lastApplied, rf.LogMax(),
 			)
@@ -424,7 +433,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.CurrentTerm = args.Term
 		rf.VotedFor = -1
 		if rf.state == ST_LEADER || rf.state == ST_CANDIDATE {
-			log.Printf(
+			RaftDPrintf(
 				"[%v] received InstallSnapshotRPC from [%v] with newer term %v, "+
 					"convert to follower from %v",
 				rf.me, args.LeaderId, args.Term, rf.state,
@@ -441,7 +450,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// Validate RPC data. Never accept old snapshot
 	if rf.LastSnapshotTerm >= args.LastIncludedTerm &&
 		rf.LastSnapshotIndex >= args.LastIncludedIndex {
-		log.Printf(
+		RaftDPrintf(
 			"[%v] discard old snapshot {LastIncludedIndex: %v, LastIncludedTerm: %v}, "+
 				"current snapshot {LastSnapshotIndex: %v, LastSnapshotTerm: %v}",
 			rf.me, args.LastIncludedIndex, args.LastIncludedTerm,
@@ -465,7 +474,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// Update lastApplied and commitIndex when apply snapshot
 	rf.lastApplied = args.LastIncludedIndex
 	rf.commitIndex = args.LastIncludedIndex
-	log.Printf(
+	RaftDPrintf(
 		"[%v] accept snapshot {LastIncludedIndex: %v, LastIncludedTerm: %v}",
 		rf.me, rf.LastSnapshotIndex, rf.LastSnapshotTerm,
 	)
@@ -478,7 +487,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	go func(msg ApplyMsg) {
 		rf.applyCh <- msg
-		log.Printf(
+		RaftDPrintf(
 			"[%v] applied snapshot {LastIncludedIndex: %v, LastIncludedTerm: %v}",
 			rf.me, msg.SnapshotIndex, msg.SnapshotTerm,
 		)
@@ -510,7 +519,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.CurrentTerm = args.Term
 		rf.VotedFor = -1
 		if rf.state == ST_LEADER || rf.state == ST_CANDIDATE {
-			log.Printf(
+			RaftDPrintf(
 				"[%v] received RequestVote from [%v] with newer term %v, "+
 					"convert to follower from %v",
 				rf.me, args.CandidateId, args.Term, rf.state,
@@ -574,7 +583,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.CurrentTerm = reply.Term
 		rf.VotedFor = -1
 		if rf.state != ST_FOLLOWER {
-			log.Printf(
+			RaftDPrintf(
 				"[%v] received AppendEntries from [%v], "+
 					"newer term with %v, convert to follower",
 				rf.me, args.LeaderId, args.Term,
@@ -593,7 +602,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// When candidate received valid AppendEntries, stop election
 	if rf.state == ST_CANDIDATE {
 		rf.state = ST_FOLLOWER
-		log.Printf(
+		RaftDPrintf(
 			"[%v] received AppendEntries from [%v], convert to follower from %v",
 			rf.me, args.LeaderId, rf.state,
 		)
@@ -605,7 +614,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XTerm = -1
 		reply.XIndex = -1
 		reply.XLen = args.PrevLogIndex - rf.LogMax()
-		log.Printf(
+		RaftDPrintf(
 			"[%v] append failed, missing prev log at index %v, log size %v",
 			rf.me, args.PrevLogIndex, rf.LogMax(),
 		)
@@ -615,7 +624,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XTerm = rf.LogTermAt(args.PrevLogIndex)
 		reply.XIndex = rf.findFirstIndexInTermX(reply.XTerm)
 		reply.XLen = -1
-		log.Printf(
+		RaftDPrintf(
 			"[%v] append failed, different prev log at index %v with term %v, log size %v",
 			rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.LogMax(),
 		)
@@ -639,7 +648,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				deleteBegin := rf.IndexInSlice(entry.Index)
 				// rf.Log = append(rf.Log[:entry.Index], args.Entries[index:]...)
 				rf.Log = append(rf.Log[:deleteBegin], args.Entries[index:]...)
-				log.Printf(
+				RaftDPrintf(
 					"[%v] delete logs from %v to %v, append %v, log size: %v",
 					rf.me, deleteBegin, oldLen, appendCount, rf.LogMax(),
 				)
@@ -647,7 +656,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 		if appendCount == 0 {
-			log.Printf("[%v] already exist logs, no need to append", rf.me)
+			RaftDPrintf("[%v] already exist logs, no need to append", rf.me)
 		}
 	}
 
@@ -655,7 +664,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	oldCommitIndex := rf.commitIndex
 	if rf.commitIndex < args.LeaderCommit {
 		rf.commitIndex = MinInt(args.LeaderCommit, rf.LogMax())
-		log.Printf(
+		RaftDPrintf(
 			"[%v] set commitIndex from %v to %v, lastApplied is %v",
 			rf.me, oldCommitIndex, rf.commitIndex, rf.lastApplied,
 		)
@@ -707,7 +716,7 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 
 	ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
 	if !ok {
-		log.Printf("[%v] send AppendEntries to [%v] timeout", rf.me, server)
+		RaftDPrintf("[%v] send AppendEntries to [%v] timeout", rf.me, server)
 		return
 	}
 
@@ -725,7 +734,7 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 		rf.CurrentTerm = reply.Term
 		rf.VotedFor = -1
 		atomic.StoreInt32(&rf.leaderRunning, 0)
-		log.Printf(
+		RaftDPrintf(
 			"[%v] send AppendEntries to [%v], newer term %v, convert to follower from %v",
 			rf.me, server, reply.Term, rf.state,
 		)
@@ -736,7 +745,7 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 		rf.nextIndex[server] = MaxInt(rf.nextIndex[server], args.Entries[endIndex].Index+1)
 		rf.matchIndex[server] = MaxInt(rf.matchIndex[server], args.Entries[endIndex].Index)
 		majorityMatch := rf.findMajorityMatch()
-		log.Printf(
+		RaftDPrintf(
 			"[%v] got majorityMatch as %v, matchIndex: %v",
 			rf.me, majorityMatch, rf.matchIndex,
 		)
@@ -745,7 +754,7 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 			rf.LogAt(majorityMatch).Term == rf.CurrentTerm {
 			rf.commitIndex = majorityMatch
 		}
-		log.Printf(
+		RaftDPrintf(
 			"[%v] send AppendEntries to [%v] with {index: %v, term: %v}, "+
 				"commitIndex at %v, lastApplied at %v",
 			rf.me, server, args.Entries[0].Index, args.Entries[0].Term,
@@ -758,7 +767,7 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 		} else {
 			rf.nextIndex[server] = MaxInt(1, rf.nextIndex[server]-reply.XLen)
 		}
-		log.Printf(
+		RaftDPrintf(
 			"[%v] send AppendEntries to [%v] failed with "+
 				"{term: %v, prevIndex: %v, prevTerm: %v, entries: %v, leaderCommit: %v} "+
 				"entries from %v to %v, "+
@@ -771,10 +780,10 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 		)
 		if rf.LastSnapshotIndex > 0 && rf.nextIndex[server] <= rf.LastSnapshotIndex {
 			go rf.sendInstallSnapshot(server)
-			log.Printf("[%v] try again with InstallSnapshot to [%v]", rf.me, server)
+			RaftDPrintf("[%v] try again with InstallSnapshot to [%v]", rf.me, server)
 		} else {
 			go rf.sendAppendEntries(server, false)
-			log.Printf("[%v] try again with AppendEntries to [%v]", rf.me, server)
+			RaftDPrintf("[%v] try again with AppendEntries to [%v]", rf.me, server)
 		}
 	}
 	// Heartbeat will return false, but no need to handle
@@ -797,7 +806,7 @@ func (rf *Raft) sendInstallSnapshot(server int) {
 
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
 	if !ok {
-		log.Printf("[%v] send InstallSnapshot to [%v] timeout", rf.me, server)
+		RaftDPrintf("[%v] send InstallSnapshot to [%v] timeout", rf.me, server)
 		return
 	}
 
@@ -814,14 +823,14 @@ func (rf *Raft) sendInstallSnapshot(server int) {
 		rf.CurrentTerm = reply.Term
 		rf.VotedFor = -1
 		atomic.StoreInt32(&rf.leaderRunning, 0)
-		log.Printf(
+		RaftDPrintf(
 			"[%v] send InstallSnapshot to [%v], newer term %v, convert to follower from %v",
 			rf.me, server, reply.Term, rf.state,
 		)
 		rf.state = ST_FOLLOWER
 	} else {
 		rf.nextIndex[server] = args.LastIncludedIndex + 1
-		log.Printf(
+		RaftDPrintf(
 			"[%v] send InstallSnapshot to [%v] successed, set nextIndex to %v",
 			rf.me, server, rf.nextIndex[server],
 		)
@@ -837,7 +846,7 @@ func (rf *Raft) StartLeaderProcess() {
 			go rf.sendAppendEntries(server, true)
 		}
 	}
-	log.Printf("[%v] first heartbeat done", rf.me)
+	RaftDPrintf("[%v] first heartbeat done", rf.me)
 
 	for {
 		// Stop while-loop when leader convert to follower
@@ -854,7 +863,7 @@ func (rf *Raft) StartLeaderProcess() {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	log.Printf("[%v] stop leader process", rf.me)
+	RaftDPrintf("[%v] stop leader process", rf.me)
 }
 
 func (rf *Raft) sendRequestVote(server int) {
@@ -875,7 +884,7 @@ func (rf *Raft) sendRequestVote(server int) {
 
 	ok := rf.peers[server].Call("Raft.RequestVote", &args, &reply)
 	if !ok {
-		log.Printf("[%v] send RequestVote to [%v] timeout", rf.me, server)
+		RaftDPrintf("[%v] send RequestVote to [%v] timeout", rf.me, server)
 		return
 	}
 
@@ -890,20 +899,20 @@ func (rf *Raft) sendRequestVote(server int) {
 	if reply.Term > rf.CurrentTerm {
 		// Stop election, convert to follower
 		rf.state = ST_FOLLOWER
-		log.Printf(
+		RaftDPrintf(
 			"[%v] send RequestVote, newer term %v from [%v], lose election",
 			rf.me, reply.Term, server,
 		)
 	} else if reply.VoteGranted {
 		// Update agreed votes
 		atomic.AddInt32(&rf.et.agreed, 1)
-		log.Printf("[%v] voted from [%v]", rf.me, server)
+		RaftDPrintf("[%v] voted from [%v]", rf.me, server)
 		if atomic.LoadInt32(&rf.et.agreed) > int32((len(rf.peers)>>1)) &&
 			rf.state == ST_CANDIDATE {
 			// Win election, convert to leader and start leaderProcess
 			rf.state = ST_LEADER
 			go rf.StartLeaderProcess()
-			log.Printf(
+			RaftDPrintf(
 				"[%v] send RequestVote, win election with term %v",
 				rf.me, rf.CurrentTerm,
 			)
@@ -911,12 +920,12 @@ func (rf *Raft) sendRequestVote(server int) {
 	} else {
 		// Update disagreed votes
 		atomic.AddInt32(&rf.et.disagreed, 1)
-		log.Printf("[%v] not voted from [%v]", rf.me, server)
+		RaftDPrintf("[%v] not voted from [%v]", rf.me, server)
 		if atomic.LoadInt32(&rf.et.disagreed) > int32(len(rf.peers)>>1) &&
 			rf.state == ST_CANDIDATE {
 			// Lose election, convert to follower
 			rf.state = ST_FOLLOWER
-			log.Printf(
+			RaftDPrintf(
 				"[%v] send RequestVote, majority disagree, lose election",
 				rf.me,
 			)
@@ -932,7 +941,7 @@ func (rf *Raft) StartElection() {
 	// Convert to candidate and increase currentTerm
 	rf.state = ST_CANDIDATE
 	rf.CurrentTerm++
-	log.Printf("[%v] start election with term %v", rf.me, rf.CurrentTerm)
+	RaftDPrintf("[%v] start election with term %v", rf.me, rf.CurrentTerm)
 	rf.persist()
 	rf.mu.Unlock()
 
@@ -964,7 +973,7 @@ func (rf *Raft) StartElection() {
 	rf.state = ST_FOLLOWER
 	rf.mu.Unlock()
 
-	log.Printf("[%v] lose election, timeout", rf.me)
+	RaftDPrintf("[%v] lose election, timeout", rf.me)
 }
 
 //
@@ -1001,7 +1010,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.persist()
 	rf.mu.Unlock()
 
-	log.Printf(
+	RaftDPrintf(
 		"[%v] Call Start, append {index: %v, term: %v, cmd: %v}, log size %v",
 		rf.me, newEntry.Index, newEntry.Term, newEntry.Command, rf.LogMax(),
 	)
@@ -1048,7 +1057,7 @@ func (rf *Raft) ticker() {
 			time.Sleep(25 * time.Millisecond)
 		}
 	}
-	log.Printf("[%v] is killed\n", rf.me)
+	RaftDPrintf("[%v] is killed\n", rf.me)
 }
 
 //
