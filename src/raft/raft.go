@@ -646,7 +646,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				oldLen := rf.LogMax()
 				appendCount = len(args.Entries) - index
 				deleteBegin := rf.IndexInSlice(entry.Index)
-				// rf.Log = append(rf.Log[:entry.Index], args.Entries[index:]...)
 				rf.Log = append(rf.Log[:deleteBegin], args.Entries[index:]...)
 				RaftDPrintf(
 					"[%v] delete logs from %v to %v, append %v, log size: %v",
