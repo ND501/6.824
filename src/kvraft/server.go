@@ -37,9 +37,9 @@ type Op struct {
 	OpValue string
 }
 
-type ReplyLog struct {
-	Err   Err
-	Value string
+type ReqId struct {
+	clientId int
+	cmdSeq   int
 }
 
 type KVServer struct {
@@ -52,25 +52,42 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	kvMap    map[string]string
-	replyMap map[int]map[int]ReplyLog
-	rpcChans map[int]chan string
+	kvMap map[string]string
+
+	replyMap    map[int]map[int]bool
+	index2reqid map[int]ReqId
+	rpcChans    map[int]chan string
 }
 
-func (kv *KVServer) HandleMsg(op *Op) string {
+// Log reply into replyMap, remove key `index` in index2reqid
+func (kv *KVServer) LogReply(index int) {
+	clientId := kv.index2reqid[index].clientId
+	cmdSeq := kv.index2reqid[index].cmdSeq
+	if _, ok := kv.replyMap[clientId]; !ok {
+		kv.replyMap[clientId] = make(map[int]bool)
+	}
+	kv.replyMap[clientId][cmdSeq] = true
+	delete(kv.index2reqid, index)
+}
+
+func (kv *KVServer) HandleMsg(index int, op *Op) string {
 	ret := ""
 	switch op.OpType {
 	case OP_GET:
 		ret = kv.kvMap[op.OpKey]
 	case OP_PUT:
+		// Set value
 		kv.kvMap[op.OpKey] = op.OpValue
+		kv.LogReply(index)
 	case OP_APPEND:
+		// Set value
 		_, ok := kv.kvMap[op.OpKey]
 		if !ok {
 			kv.kvMap[op.OpKey] = op.OpValue
 		} else {
 			kv.kvMap[op.OpKey] += op.OpValue
 		}
+		kv.LogReply(index)
 	default:
 		DPrintf("[%v] HandleMsg unknown OpType %v", kv.me, op.OpType)
 	}
@@ -92,12 +109,9 @@ func (kv *KVServer) ApplyMsgDispatch() {
 				kv.mu.Lock()
 				ch, ok := kv.rpcChans[msg.CommandIndex]
 				// Handle Get/PutAppend
-				ret := kv.HandleMsg(&cmd)
+				ret := kv.HandleMsg(msg.CommandIndex, &cmd)
 				kv.mu.Unlock()
-				if !ok {
-					// may RPC timeout and delete channel
-					DPrintf("[%v] cannot find rpc channel", kv.me)
-				} else {
+				if ok {
 					// Notify RPC goroutine
 					go func() { ch <- ret }()
 				}
@@ -121,27 +135,11 @@ func (kv *KVServer) ApplyMsgDispatch() {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	DPrintf("[%v] received Get with %+v", kv.me, args)
 	logCommand := Op{}
 	logCommand.OpType = OP_GET
 	logCommand.OpKey = args.Key
 
 	kv.mu.Lock()
-	// // Judging whether a request is a duplicate
-	// if clientLog, ok := kv.replyMap[args.ClientId]; ok {
-	// 	// If request already handled, return reply log
-	// 	if repLog, ok := clientLog[args.CmdSeq]; ok {
-	// 		reply.Err = repLog.Err
-	// 		reply.Value = repLog.Value
-	// 		kv.mu.Unlock()
-	// 		DPrintf("[%v] received stray request, reply %+v", kv.me, reply)
-	// 		return
-	// 	}
-	// 	// Otherwise, this is a new request, processing continue
-	// } else {
-	// 	kv.replyMap[args.ClientId] = make(map[int]ReplyLog)
-	// }
-	// Call Start() to make agreement
 	logIndex, _, isLeader := kv.rf.Start(logCommand)
 	// Register rpcChannel for current RPC handler
 	ch := make(chan string)
@@ -155,29 +153,21 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	// Wait for operation log apply
 	select {
-	case <-ch:
-		kv.mu.Lock()
+	case reply.Value = <-ch:
 		reply.Err = OK
-		// TODO: optimize this, acquire lock three times in one rpc.
-		reply.Value = kv.kvMap[args.Key]
-		kv.mu.Unlock()
-		DPrintf("[%v] reply Get %+v with %+v", kv.me, args, reply)
 	case <-time.After(EXECUTE_TIMEOUT):
 		reply.Err = ErrTimeout
-		DPrintf("[%v] handle Get() timeout", kv.me)
 	}
+	DPrintf("[%v] Get, args: %+v, reply: %+v", kv.me, args, reply)
 
 unregister_and_return:
 	kv.mu.Lock()
-	// // Save as reply log
-	// kv.replyMap[args.ClientId][args.CmdSeq] = ReplyLog{reply.Err, reply.Value}
 	delete(kv.rpcChans, logIndex)
 	kv.mu.Unlock()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	DPrintf("[%v] received PutAppend with %+v", kv.me, args)
 	logCommand := Op{}
 	if args.Op == "Put" {
 		logCommand.OpType = OP_PUT
@@ -188,24 +178,20 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	logCommand.OpValue = args.Value
 
 	kv.mu.Lock()
-	// // Judging whether a request is a duplicate
-	// if clientLog, ok := kv.replyMap[args.ClientId]; ok {
-	// 	// If request already handled, return reply log
-	// 	if repLog, ok := clientLog[args.CmdSeq]; ok {
-	// 		reply.Err = repLog.Err
-	// 		kv.mu.Unlock()
-	// 		DPrintf("[%v] received stray request, reply %+v", kv.me, reply)
-	// 		return
-	// 	}
-	// 	// Otherwise, this is a new request, processing continue
-	// } else {
-	// 	kv.replyMap[args.ClientId] = make(map[int]ReplyLog)
-	// }
+	// Judging whether a request is a duplicate
+	if clientLog, ok := kv.replyMap[args.ClientId]; ok {
+		if _, ok := clientLog[args.CmdSeq]; ok {
+			kv.mu.Unlock()
+			reply.Err = OK
+			return
+		}
+	}
 	// Call Start() to make agreement
 	logIndex, _, isLeader := kv.rf.Start(logCommand)
 	// Register rpcChannel for current RPC handler
 	ch := make(chan string)
 	kv.rpcChans[logIndex] = ch
+	kv.index2reqid[logIndex] = ReqId{args.ClientId, args.CmdSeq}
 	kv.mu.Unlock()
 
 	if !isLeader {
@@ -217,11 +203,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	select {
 	case <-ch:
 		reply.Err = OK
-		DPrintf("[%v] reply PutAppend %+v with %+v", kv.me, args, reply)
 	case <-time.After(EXECUTE_TIMEOUT):
 		reply.Err = ErrTimeout
-		DPrintf("[%v] handle PutAppend() timeout", kv.me)
 	}
+	DPrintf("[%v] PutAppend, args: %+v, reply: %+v", kv.me, args, reply)
 
 unregister_and_return:
 	kv.mu.Lock()
@@ -277,7 +262,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.kvMap = make(map[string]string)
-	kv.replyMap = make(map[int]map[int]ReplyLog)
+	kv.replyMap = make(map[int]map[int]bool)
+	kv.index2reqid = map[int]ReqId{}
 	kv.rpcChans = make(map[int]chan string)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
