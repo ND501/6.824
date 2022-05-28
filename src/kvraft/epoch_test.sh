@@ -27,7 +27,7 @@ do
   then
     echo "iter ${i} fail"
   else
-    # rm ./${output}/${test_name}/${i}.log
-    echo "passed"
+    rm ./${output}/${test_name}/${i}.log
+    # echo "passed"
   fi
 done

@@ -73,7 +73,7 @@ func (ck *Clerk) Get(key string) string {
 			// Tried a loop, wait for election finish
 			if ii%len(ck.servers) == 0 {
 				DPrintf("[%v] Get tried a loop, sleep a while", ck.clientId)
-				time.Sleep(400 * time.Millisecond)
+				time.Sleep(100 * time.Millisecond)
 			}
 			// Reset leaderId
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
