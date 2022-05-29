@@ -2,9 +2,10 @@
 
 test_name=$1
 epoch=$2
+timeout=60
 output="test_log"
 
-echo "run test ${test_name} for epoch ${epoch}"
+echo "run test ${test_name} for epoch ${epoch}, timeout ${timeout} s"
 
 if [ ! -d "./${output}" ]
 then
@@ -18,7 +19,7 @@ fi
 
 for((i = 1; i <= $epoch ;i++))
 do
-  nohup time go test -run ${test_name} > ./${output}/${test_name}/${i}.log 2>&1 &
+  nohup time go test -run ${test_name} -timeout ${timeout}s > ./${output}/${test_name}/${i}.log 2>&1 &
   wait
   false_name=$(cat ./${output}/${test_name}/${i}.log | grep 'FAIL' | wc -l)
   wait

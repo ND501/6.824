@@ -30,7 +30,7 @@ import (
 	"6.824/labrpc"
 )
 
-const RaftDebug = false
+const RaftDebug = true
 
 func RaftDPrintf(format string, a ...interface{}) (n int, err error) {
 	if RaftDebug {
@@ -84,6 +84,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
 	// For 2D:
 	SnapshotValid bool
@@ -383,6 +384,7 @@ func (rf *Raft) EndlessApply() {
 				CommandValid: true,
 				Command:      entry.Command,
 				CommandIndex: entry.Index,
+				CommandTerm:  entry.Term,
 			}
 			RaftDPrintf("[%v] applied %+v", rf.me, entry)
 		}
@@ -614,20 +616,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XTerm = -1
 		reply.XIndex = -1
 		reply.XLen = args.PrevLogIndex - rf.LogMax()
-		RaftDPrintf(
-			"[%v] append failed, missing prev log at index %v, log size %v",
-			rf.me, args.PrevLogIndex, rf.LogMax(),
-		)
+		if len(args.Entries) > 0 {
+			RaftDPrintf(
+				"[%v] append failed, missing prev log at index %v, log size %v",
+				rf.me, args.PrevLogIndex, rf.LogMax(),
+			)
+		}
 		return
 	} else if rf.LogTermAt(args.PrevLogIndex) != args.PrevLogTerm {
 		// Conflict arise, different prev log, record XTerm and XIndex to AppendEntriesReply
 		reply.XTerm = rf.LogTermAt(args.PrevLogIndex)
 		reply.XIndex = rf.findFirstIndexInTermX(reply.XTerm)
 		reply.XLen = -1
-		RaftDPrintf(
-			"[%v] append failed, different prev log at index %v with term %v, log size %v",
-			rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.LogMax(),
-		)
+		if len(args.Entries) > 0 {
+			RaftDPrintf(
+				"[%v] append failed, different prev log at index %v with term %v, log size %v",
+				rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.LogMax(),
+			)
+		}
 		return
 	}
 
@@ -647,10 +653,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				appendCount = len(args.Entries) - index
 				deleteBegin := rf.IndexInSlice(entry.Index)
 				rf.Log = append(rf.Log[:deleteBegin], args.Entries[index:]...)
-				RaftDPrintf(
-					"[%v] delete logs from %v to %v, append %v, log size: %v",
-					rf.me, deleteBegin, oldLen, appendCount, rf.LogMax(),
-				)
+				if deleteBegin < oldLen {
+					RaftDPrintf(
+						"[%v] delete logs from %v to %v, append %v, log size: %v",
+						rf.me, deleteBegin, oldLen, appendCount, rf.LogMax(),
+					)
+				}
 				break
 			}
 		}
@@ -715,7 +723,7 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 
 	ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
 	if !ok {
-		RaftDPrintf("[%v] send AppendEntries to [%v] timeout", rf.me, server)
+		// RaftDPrintf("[%v] send AppendEntries to [%v] timeout", rf.me, server)
 		return
 	}
 
@@ -805,7 +813,7 @@ func (rf *Raft) sendInstallSnapshot(server int) {
 
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
 	if !ok {
-		RaftDPrintf("[%v] send InstallSnapshot to [%v] timeout", rf.me, server)
+		// RaftDPrintf("[%v] send InstallSnapshot to [%v] timeout", rf.me, server)
 		return
 	}
 
@@ -883,7 +891,7 @@ func (rf *Raft) sendRequestVote(server int) {
 
 	ok := rf.peers[server].Call("Raft.RequestVote", &args, &reply)
 	if !ok {
-		RaftDPrintf("[%v] send RequestVote to [%v] timeout", rf.me, server)
+		// RaftDPrintf("[%v] send RequestVote to [%v] timeout", rf.me, server)
 		return
 	}
 

@@ -11,7 +11,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -57,34 +57,30 @@ type KVServer struct {
 	// Your definitions here.
 	kvMap map[string]string
 
-	replyMap map[int]map[int]int
+	replyMap map[int]int
 	rpcChans map[int]chan string
 }
 
-func (kv *KVServer) HandleMsg(index int, op *Op) string {
+func (kv *KVServer) HandleMsg(index int, term int, op *Op) string {
 	ret := ""
 	switch op.OpType {
 	case OP_GET:
 		ret = kv.kvMap[op.OpKey]
 	case OP_PUT:
-		// Set value
-		kv.kvMap[op.OpKey] = op.OpValue
-		if _, ok := kv.replyMap[op.ClientId]; !ok {
-			kv.replyMap[op.ClientId] = make(map[int]int)
-		}
-		kv.replyMap[op.ClientId][op.CmdSeq] = ST_DONE
-	case OP_APPEND:
-		// Set value
-		_, ok := kv.kvMap[op.OpKey]
-		if !ok {
+		if !kv.isRetransmitRPC(op.ClientId, op.CmdSeq) {
 			kv.kvMap[op.OpKey] = op.OpValue
-		} else {
-			kv.kvMap[op.OpKey] += op.OpValue
+			kv.replyMap[op.ClientId] = op.CmdSeq
 		}
-		if _, ok := kv.replyMap[op.ClientId]; !ok {
-			kv.replyMap[op.ClientId] = make(map[int]int)
+	case OP_APPEND:
+		if !kv.isRetransmitRPC(op.ClientId, op.CmdSeq) {
+			_, ok := kv.kvMap[op.OpKey]
+			if !ok {
+				kv.kvMap[op.OpKey] = op.OpValue
+			} else {
+				kv.kvMap[op.OpKey] += op.OpValue
+			}
+			kv.replyMap[op.ClientId] = op.CmdSeq
 		}
-		kv.replyMap[op.ClientId][op.CmdSeq] = ST_DONE
 	default:
 		DPrintf("[%v] HandleMsg unknown OpType %v", kv.me, op.OpType)
 	}
@@ -104,9 +100,10 @@ func (kv *KVServer) ApplyMsgDispatch() {
 					kv.me, msg.CommandIndex, cmd,
 				)
 				kv.mu.Lock()
+				// Get notify channel from rpcChans
 				ch, ok := kv.rpcChans[msg.CommandIndex]
 				// Handle Get/PutAppend
-				ret := kv.HandleMsg(msg.CommandIndex, &cmd)
+				ret := kv.HandleMsg(msg.CommandIndex, msg.CommandTerm, &cmd)
 				kv.mu.Unlock()
 				if ok {
 					// Notify RPC goroutine
@@ -163,6 +160,14 @@ unregister_and_return:
 	kv.mu.Unlock()
 }
 
+func (kv *KVServer) isRetransmitRPC(clientId int, cmdSeq int) bool {
+	if _, ok := kv.replyMap[clientId]; ok {
+		return kv.replyMap[clientId] >= cmdSeq
+	} else {
+		return false
+	}
+}
+
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	logCommand := Op{0, args.Key, args.Value, args.ClientId, args.CmdSeq}
@@ -172,43 +177,22 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		logCommand.OpType = OP_APPEND
 	}
 
-	var logIndex int
-	var isLeader bool
-	var ch chan string
-
 	kv.mu.Lock()
-	// Judging whether a request is a duplicate
-	if _, ok := kv.replyMap[args.ClientId]; !ok {
-		kv.replyMap[args.ClientId] = make(map[int]int)
-	}
-	if _, ok := kv.replyMap[args.ClientId][args.CmdSeq]; !ok {
-		kv.replyMap[args.ClientId][args.CmdSeq] = ST_INIT
-	}
-	switch kv.replyMap[args.ClientId][args.CmdSeq] {
-	case ST_INIT:
-		// Call Start() to make agreement
-		logIndex, _, isLeader = kv.rf.Start(logCommand)
-		if !isLeader {
-			reply.Err = ErrWrongLeader
-			kv.mu.Unlock()
-			return
-		}
-		// Register rpcChannel for current RPC handler
-		ch = make(chan string)
-		kv.rpcChans[logIndex] = ch
-		// Write to ReplyLog
-		kv.replyMap[args.ClientId][args.CmdSeq] = ST_DOING
-	case ST_DOING:
-		// Return ErrTimeout, let client try again
-		reply.Err = ErrTimeout
-		kv.mu.Unlock()
-		return
-	case ST_DONE:
-		// Already done, return OK
+	if kv.isRetransmitRPC(args.ClientId, args.CmdSeq) {
+		// Reply OK to re-transmit RPC
 		reply.Err = OK
 		kv.mu.Unlock()
 		return
 	}
+	logIndex, _, isLeader := kv.rf.Start(logCommand)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+	// Register rpcChannel for current RPC handler
+	ch := make(chan string)
+	kv.rpcChans[logIndex] = ch
 	kv.mu.Unlock()
 
 	// Wait for operation log apply
@@ -271,7 +255,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.kvMap = make(map[string]string)
-	kv.replyMap = make(map[int]map[int]int)
+	kv.replyMap = make(map[int]int)
 	kv.rpcChans = make(map[int]chan string)
 
 	kv.applyCh = make(chan raft.ApplyMsg)

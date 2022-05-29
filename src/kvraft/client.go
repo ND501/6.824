@@ -59,6 +59,7 @@ func (ck *Clerk) Get(key string) string {
 		reply := GetReply{}
 		ok := ck.servers[ck.leaderId].Call("KVServer.Get", &args, &reply)
 		if !ok {
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 			continue
 		}
 
@@ -100,33 +101,30 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ck.cmdseq++
 	args := PutAppendArgs{key, value, op, ck.clientId, ck.cmdseq}
 
-	DPrintf("[%v] try to PutAppend %+v", ck.clientId, args)
+	DPrintf("[%v] try to PutAppend %+v to [%v]", ck.clientId, args, ck.leaderId)
 
 	for ii := 1; ; ii++ {
 		if ii%100 == 0 {
-			DPrintf("[%v] tried PutAppend %v times", ck.clientId, ii)
+			DPrintf("[%v] tried PutAppend to [%v] %v times", ck.clientId, ck.leaderId, ii)
 		}
 
 		reply := PutAppendReply{}
 		ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", &args, &reply)
 		if !ok {
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 			continue
 		}
 
 		switch reply.Err {
 		case OK:
-			DPrintf("[%v] PutAppend OK, args: %+v", ck.clientId, args)
+			DPrintf("[%v] PutAppend to [%v] OK, args: %+v", ck.clientId, ck.leaderId, args)
 			return
 		case ErrWrongLeader:
-			// Tried a loop, wait for election finish
-			if ii%len(ck.servers) == 0 {
-				DPrintf("[%v] PutAppend tried a loop, sleep a while", ck.clientId)
-				time.Sleep(400 * time.Millisecond)
-			}
+			time.Sleep(25 * time.Millisecond)
 			// Reset leaderId
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 		case ErrTimeout:
-
+			time.Sleep(25 * time.Millisecond)
 		default:
 			DPrintf("[%v] PutAppend unexpected err %v", ck.clientId, reply.Err)
 		}
