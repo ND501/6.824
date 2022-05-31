@@ -365,6 +365,13 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.LastSnapshotIndex = index
 }
 
+func (rf *Raft) SignalPeriodically() {
+	for !rf.killed() {
+		time.Sleep(100 * time.Millisecond)
+		rf.cond.Signal()
+	}
+}
+
 func (rf *Raft) EndlessApply() {
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -576,7 +583,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	} else if rf.CurrentTerm < args.Term {
 		// Update currentTerm, set votedFor to null (-1)
-		rf.CurrentTerm = reply.Term
+		rf.CurrentTerm = args.Term
 		rf.VotedFor = -1
 		if rf.state != ST_FOLLOWER {
 			RaftDPrintf(
@@ -643,10 +650,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				appendCount = len(args.Entries) - index
 				deleteBegin := rf.IndexInSlice(entry.Index)
 				rf.Log = append(rf.Log[:deleteBegin], args.Entries[index:]...)
-				if deleteBegin < oldLen {
+				if entry.Index < oldLen {
 					RaftDPrintf(
-						"[%v] delete logs from %v to %v, append %v, log size: %v",
-						rf.me, deleteBegin, oldLen, appendCount, rf.LogMax(),
+						"[%v] delete logs from %v to %v, append %v entries, log size %v, args: "+
+							"{Term: %v, Id:%v, prevIndex: %v, prevTerm: %v, Len: %v, LeaderCommit: %v}",
+						rf.me, entry.Index, oldLen, appendCount, rf.LogMax(), args.Term, args.LeaderId,
+						args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderCommit,
 					)
 				}
 				break
@@ -1050,7 +1059,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	rf.cond.Signal()
 }
 
 func (rf *Raft) killed() bool {
@@ -1108,6 +1116,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start applier goroutine
 	go rf.EndlessApply()
+	go rf.SignalPeriodically()
 
 	return rf
 }
