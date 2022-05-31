@@ -128,6 +128,7 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg       // apply message to state machine
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -149,10 +150,10 @@ type Raft struct {
 	LastSnapshotIndex int
 	LastSnapshotTerm  int
 
-	et            ElectionTools
-	state         State
-	applyCh       chan ApplyMsg
-	leaderRunning int32
+	et          ElectionTools
+	state       State
+	cond        sync.Cond
+	skipSleepCh chan bool
 }
 
 func (rf *Raft) init(applyCh chan ApplyMsg) {
@@ -163,6 +164,8 @@ func (rf *Raft) init(applyCh chan ApplyMsg) {
 	rf.VotedFor = -1
 	rf.state = ST_FOLLOWER
 	rf.et.beginTime = time.Now()
+	rf.cond = *sync.NewCond(&rf.mu)
+	rf.skipSleepCh = make(chan bool)
 
 	rf.LastSnapshotIndex = 0
 	rf.LastSnapshotTerm = 0
@@ -173,7 +176,6 @@ func (rf *Raft) initLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	atomic.StoreInt32(&rf.leaderRunning, 1)
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	for i := range rf.nextIndex {
@@ -332,9 +334,6 @@ func (rf *Raft) readPersistSnapshot(data []byte) {
 // have more recent info since it communicate the snapshot on applyCh.
 //
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
-	// Your code here (2D).
-
 	return true
 }
 
@@ -367,14 +366,16 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 func (rf *Raft) EndlessApply() {
-	var toApply []LogEntry
 	for !rf.killed() {
-		// Check if there are appliable entries
 		rf.mu.Lock()
-		if rf.commitIndex > rf.lastApplied {
-			toApply = make([]LogEntry, rf.commitIndex-rf.lastApplied)
-			copy(toApply, rf.Log[rf.IndexInSlice(rf.lastApplied+1):rf.IndexInSlice(rf.commitIndex+1)])
+		rf.cond.Wait()
+		if rf.commitIndex <= rf.lastApplied {
+			rf.mu.Unlock()
+			continue
 		}
+		// If there are appliable entries, wake up from cond.Wait()
+		toApply := make([]LogEntry, rf.commitIndex-rf.lastApplied)
+		copy(toApply, rf.Log[rf.IndexInSlice(rf.lastApplied+1):rf.IndexInSlice(rf.commitIndex+1)])
 		curCommitIndex := rf.commitIndex
 		rf.mu.Unlock()
 
@@ -399,13 +400,8 @@ func (rf *Raft) EndlessApply() {
 			)
 		}
 		rf.mu.Unlock()
-
-		// Clear entries' copy slice
-		toApply = nil
-
-		// Sleep for 50 ms
-		time.Sleep(50 * time.Millisecond)
 	}
+	RaftDPrintf("[%v] stop EndlessApply goroutine", rf.me)
 }
 
 type InstallSnapshotArgs struct {
@@ -441,7 +437,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 				rf.me, args.LeaderId, args.Term, rf.state,
 			)
 			rf.state = ST_FOLLOWER
-			atomic.StoreInt32(&rf.leaderRunning, 0)
 		}
 	}
 	// Reset election timer
@@ -527,7 +522,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				rf.me, args.CandidateId, args.Term, rf.state,
 			)
 			rf.state = ST_FOLLOWER
-			atomic.StoreInt32(&rf.leaderRunning, 0)
 		}
 	}
 	if rf.VotedFor == -1 || rf.VotedFor == args.CandidateId {
@@ -590,10 +584,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					"newer term with %v, convert to follower",
 				rf.me, args.LeaderId, args.Term,
 			)
-			// When stray leader get back, may received AppendEntries with newer term
-			if rf.state == ST_LEADER {
-				atomic.StoreInt32(&rf.leaderRunning, 0)
-			}
 			rf.state = ST_FOLLOWER
 		}
 	}
@@ -675,6 +665,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			"[%v] set commitIndex from %v to %v, lastApplied is %v",
 			rf.me, oldCommitIndex, rf.commitIndex, rf.lastApplied,
 		)
+		// Notify EndlessApply goroutine to apply msg
+		rf.cond.Signal()
 	}
 }
 
@@ -740,7 +732,6 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 		// Stop leader process and convert to follower when received newer term
 		rf.CurrentTerm = reply.Term
 		rf.VotedFor = -1
-		atomic.StoreInt32(&rf.leaderRunning, 0)
 		RaftDPrintf(
 			"[%v] send AppendEntries to [%v], newer term %v, convert to follower from %v",
 			rf.me, server, reply.Term, rf.state,
@@ -759,12 +750,19 @@ func (rf *Raft) sendAppendEntries(server int, isHeartbeat bool) {
 		// Try to update commitIndex
 		if majorityMatch > rf.commitIndex &&
 			rf.LogAt(majorityMatch).Term == rf.CurrentTerm {
+			oldCommitIndex := rf.commitIndex
 			rf.commitIndex = majorityMatch
+			RaftDPrintf(
+				"[%v] set commitIndex from %v to %v, lastApplied is %v",
+				rf.me, oldCommitIndex, rf.commitIndex, rf.lastApplied,
+			)
+			// Notify EndlessApply goroutine to apply msg
+			rf.cond.Signal()
 		}
 		RaftDPrintf(
-			"[%v] send AppendEntries to [%v] with {index: %v, term: %v}, "+
+			"[%v] send AppendEntries to [%v] with {index: %v, term: %v, len: %v}, "+
 				"commitIndex at %v, lastApplied at %v",
-			rf.me, server, args.Entries[0].Index, args.Entries[0].Term,
+			rf.me, server, args.Entries[0].Index, args.Entries[0].Term, len(args.Entries),
 			rf.commitIndex, rf.lastApplied,
 		)
 	} else if !isHeartbeat {
@@ -829,7 +827,6 @@ func (rf *Raft) sendInstallSnapshot(server int) {
 	if reply.Term > rf.CurrentTerm {
 		rf.CurrentTerm = reply.Term
 		rf.VotedFor = -1
-		atomic.StoreInt32(&rf.leaderRunning, 0)
 		RaftDPrintf(
 			"[%v] send InstallSnapshot to [%v], newer term %v, convert to follower from %v",
 			rf.me, server, reply.Term, rf.state,
@@ -846,6 +843,10 @@ func (rf *Raft) sendInstallSnapshot(server int) {
 
 func (rf *Raft) StartLeaderProcess() {
 	rf.initLeader()
+	// Get currentTerm
+	rf.mu.Lock()
+	leaderTerm := rf.CurrentTerm
+	rf.mu.Unlock()
 
 	// First heartbeats upon leader init done
 	for server := range rf.peers {
@@ -857,20 +858,26 @@ func (rf *Raft) StartLeaderProcess() {
 
 	for {
 		// Stop while-loop when leader convert to follower
-		if atomic.LoadInt32(&rf.leaderRunning) == 0 {
+		rf.mu.Lock()
+		if rf.state != ST_LEADER || rf.CurrentTerm != leaderTerm {
+			rf.mu.Unlock()
 			break
 		}
+		rf.mu.Unlock()
 		// Send heartbeats or AppendEntries
 		for server := range rf.peers {
 			if server != rf.me {
 				go rf.sendAppendEntries(server, false)
 			}
 		}
-		// Sleep for 100 milliseconds
-		time.Sleep(100 * time.Millisecond)
+		// Sleep for 100 milliseconds, or skip sleep message come
+		select {
+		case <-rf.skipSleepCh:
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 
-	RaftDPrintf("[%v] stop leader process", rf.me)
+	RaftDPrintf("[%v] stop leader process with term %v", rf.me, leaderTerm)
 }
 
 func (rf *Raft) sendRequestVote(server int) {
@@ -906,6 +913,8 @@ func (rf *Raft) sendRequestVote(server int) {
 	if reply.Term > rf.CurrentTerm {
 		// Stop election, convert to follower
 		rf.state = ST_FOLLOWER
+		rf.CurrentTerm = reply.Term
+		rf.VotedFor = -1
 		RaftDPrintf(
 			"[%v] send RequestVote, newer term %v from [%v], lose election",
 			rf.me, reply.Term, server,
@@ -913,7 +922,7 @@ func (rf *Raft) sendRequestVote(server int) {
 	} else if reply.VoteGranted {
 		// Update agreed votes
 		atomic.AddInt32(&rf.et.agreed, 1)
-		RaftDPrintf("[%v] voted from [%v]", rf.me, server)
+		RaftDPrintf("[%v] voted from [%v] with %+v", rf.me, server, args)
 		if atomic.LoadInt32(&rf.et.agreed) > int32((len(rf.peers)>>1)) &&
 			rf.state == ST_CANDIDATE {
 			// Win election, convert to leader and start leaderProcess
@@ -927,7 +936,7 @@ func (rf *Raft) sendRequestVote(server int) {
 	} else {
 		// Update disagreed votes
 		atomic.AddInt32(&rf.et.disagreed, 1)
-		RaftDPrintf("[%v] not voted from [%v]", rf.me, server)
+		RaftDPrintf("[%v] not voted from [%v] with %+v", rf.me, server, args)
 		if atomic.LoadInt32(&rf.et.disagreed) > int32(len(rf.peers)>>1) &&
 			rf.state == ST_CANDIDATE {
 			// Lose election, convert to follower
@@ -1004,8 +1013,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	rf.mu.Lock()
-	// If server is not leader, or leader init not finished, return false
-	if rf.state != ST_LEADER || atomic.LoadInt32(&rf.leaderRunning) == 0 {
+	// Return false if server is not leader
+	if rf.state != ST_LEADER {
 		rf.mu.Unlock()
 		return index, term, false
 	}
@@ -1016,6 +1025,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.Log = append(rf.Log, newEntry)
 	rf.persist()
 	rf.mu.Unlock()
+
+	go func() { rf.skipSleepCh <- true }()
 
 	RaftDPrintf(
 		"[%v] Call Start, append {index: %v, term: %v, cmd: %v}, log size %v",
@@ -1039,7 +1050,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	atomic.StoreInt32(&rf.leaderRunning, 0)
+	rf.cond.Signal()
 }
 
 func (rf *Raft) killed() bool {
@@ -1102,5 +1113,5 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func init() {
-	log.SetFlags(log.Ltime)
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
 }
