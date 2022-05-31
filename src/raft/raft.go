@@ -650,19 +650,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				appendCount = len(args.Entries) - index
 				deleteBegin := rf.IndexInSlice(entry.Index)
 				rf.Log = append(rf.Log[:deleteBegin], args.Entries[index:]...)
-				if entry.Index < oldLen {
-					RaftDPrintf(
-						"[%v] delete logs from %v to %v, append %v entries, log size %v, args: "+
-							"{Term: %v, Id:%v, prevIndex: %v, prevTerm: %v, Len: %v, LeaderCommit: %v}",
-						rf.me, entry.Index, oldLen, appendCount, rf.LogMax(), args.Term, args.LeaderId,
-						args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderCommit,
-					)
-				}
+				RaftDPrintf(
+					"[%v] current logMax %v, append from %v to %v, args begin with %v: "+
+						"{Term:%v, Id:%v, prevIndex:%v, prevTerm:%v, leaderCommit:%v}",
+					rf.me, oldLen, entry.Index, rf.LogMax(), args.Entries[0].Index,
+					args.Term, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit,
+				)
 				break
 			}
 		}
 		if appendCount == 0 {
-			RaftDPrintf("[%v] already exist logs, no need to append", rf.me)
+			RaftDPrintf(
+				"[%v] already exist logs to %v, args from %v to %v: "+
+					"{Term:%v, Id:%v, prevIndex:%v, prevTerm:%v, leaderCommit:%v}",
+				rf.me, rf.LogMax(), args.Entries[0].Index, args.Entries[len(args.Entries)-1].Index,
+				args.Term, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit,
+			)
 		}
 	}
 
