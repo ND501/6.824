@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -11,7 +12,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -45,11 +46,12 @@ type Op struct {
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
+	mu        sync.Mutex
+	me        int
+	rf        *raft.Raft
+	applyCh   chan raft.ApplyMsg
+	dead      int32 // set by Kill()
+	persister *raft.Persister
 
 	maxraftstate int // snapshot if log grows this big
 
@@ -111,11 +113,16 @@ func (kv *KVServer) ApplyMsgDispatch() {
 					msg.CommandTerm == currentTerm && ok {
 					go func(toReply OpResult) { ch <- toReply }(toReply)
 				}
+				// Check for snapshot
+				if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
+					kv.rf.Snapshot(msg.CommandIndex, kv.getPersist())
+				}
 				kv.mu.Unlock()
 			} else if msg.SnapshotValid {
 				// Snapshot applied
+				kv.readPersist(msg.Snapshot)
 				DPrintf(
-					"[%v] applied snapshot {Index: %v, Term: %v}",
+					"[%v] applied snapshot {Index:%v, Term:%v}",
 					kv.me, msg.SnapshotIndex, msg.SnapshotTerm,
 				)
 			} else {
@@ -218,6 +225,34 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Unlock()
 }
 
+func (kv *KVServer) getPersist() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(kv.kvMap)
+	e.Encode(kv.replyMap)
+
+	data := w.Bytes()
+	return data
+}
+
+func (kv *KVServer) readPersist(data []byte) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var kvMap map[string]string
+	var replyMap map[int]int
+	if d.Decode(&kvMap) != nil ||
+		d.Decode(&replyMap) != nil {
+		DPrintf("[%v] read from persist failed", kv.me)
+	} else {
+		kv.kvMap = kvMap
+		kv.replyMap = replyMap
+	}
+}
+
 //
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
@@ -261,6 +296,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
 	// You may need initialization code here.
 	kv.kvMap = make(map[string]string)
@@ -269,6 +305,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	kv.readPersist(persister.ReadSnapshot())
 
 	// You may need initialization code here.
 	go kv.ApplyMsgDispatch()

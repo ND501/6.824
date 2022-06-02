@@ -30,7 +30,7 @@ import (
 	"6.824/labrpc"
 )
 
-const RaftDebug = true
+const RaftDebug = false
 
 func RaftDPrintf(format string, a ...interface{}) (n int, err error) {
 	if RaftDebug {
@@ -302,7 +302,7 @@ func (rf *Raft) readPersist(data []byte) {
 		d.Decode(&Log) != nil ||
 		d.Decode(&LastSnapshotIndex) != nil ||
 		d.Decode(&LastSnapshotTerm) != nil {
-		RaftDPrintf("Read from persist failed")
+		RaftDPrintf("[%v] read from persist failed", rf.me)
 	} else {
 		rf.CurrentTerm = CurrentTerm
 		rf.VotedFor = VotedFor
