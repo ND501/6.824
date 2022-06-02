@@ -11,7 +11,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -21,12 +21,6 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 const EXECUTE_TIMEOUT time.Duration = 200 * time.Millisecond
-
-const (
-	ST_INIT  int = 0
-	ST_DOING int = 1
-	ST_DONE  int = 2
-)
 
 const (
 	OP_GET    int = 1
@@ -57,58 +51,53 @@ type KVServer struct {
 	// Your definitions here.
 	kvMap map[string]string
 
-	replyMap map[int]int
-	rpcChans map[int]chan string
-}
-
-func (kv *KVServer) HandleMsg(index int, term int, op *Op) string {
-	ret := ""
-	switch op.OpType {
-	case OP_GET:
-		ret = kv.kvMap[op.OpKey]
-	case OP_PUT:
-		if !kv.isRetransmitRPC(op.ClientId, op.CmdSeq) {
-			kv.kvMap[op.OpKey] = op.OpValue
-			kv.replyMap[op.ClientId] = op.CmdSeq
-		}
-	case OP_APPEND:
-		if !kv.isRetransmitRPC(op.ClientId, op.CmdSeq) {
-			_, ok := kv.kvMap[op.OpKey]
-			if !ok {
-				kv.kvMap[op.OpKey] = op.OpValue
-			} else {
-				kv.kvMap[op.OpKey] += op.OpValue
-			}
-			kv.replyMap[op.ClientId] = op.CmdSeq
-		}
-	default:
-		DPrintf("[%v] HandleMsg unknown OpType %v", kv.me, op.OpType)
-	}
-	return ret
+	replyMap    map[int]int
+	rpcChans    map[int]chan string
+	lastApplied int
 }
 
 func (kv *KVServer) ApplyMsgDispatch() {
 	DPrintf("[%v] start ApplyMsgDispatch", kv.me)
+	var getStr string
 	for !kv.killed() {
 		select {
 		case msg := <-kv.applyCh:
 			if msg.CommandValid {
-				// Log applied
+				// Check apply index
+				kv.mu.Lock()
+				if msg.CommandIndex <= kv.lastApplied {
+					kv.mu.Unlock()
+					continue
+				}
+				kv.lastApplied = msg.CommandIndex
+				// Debug print
 				cmd := msg.Command.(Op)
 				DPrintf(
 					"[%v] applied log {Index: %v, Cmd: %+v}",
 					kv.me, msg.CommandIndex, cmd,
 				)
-				kv.mu.Lock()
-				// Get notify channel from rpcChans
-				ch, ok := kv.rpcChans[msg.CommandIndex]
-				// Handle Get/PutAppend
-				ret := kv.HandleMsg(msg.CommandIndex, msg.CommandTerm, &cmd)
-				kv.mu.Unlock()
-				if ok {
-					// Notify RPC goroutine
-					go func() { ch <- ret }()
+				// Handle applied log
+				if cmd.OpType == OP_GET {
+					getStr = kv.kvMap[cmd.OpKey]
+				} else {
+					if !kv.isRetransmitRPC(cmd.ClientId, cmd.CmdSeq) {
+						// Save clientId and sequence number
+						kv.replyMap[cmd.ClientId] = cmd.CmdSeq
+						// apply to state machine
+						_, ok := kv.kvMap[cmd.OpKey]
+						if cmd.OpType == OP_PUT || !ok {
+							kv.kvMap[cmd.OpKey] = cmd.OpValue
+						} else {
+							kv.kvMap[cmd.OpKey] += cmd.OpValue
+						}
+					}
 				}
+				// Notify RPC goroutine
+				ch, ok := kv.rpcChans[msg.CommandIndex]
+				if ok {
+					go func(str string) { ch <- str }(getStr)
+				}
+				kv.mu.Unlock()
 			} else if msg.SnapshotValid {
 				// Snapshot applied
 				DPrintf(
@@ -125,6 +114,7 @@ func (kv *KVServer) ApplyMsgDispatch() {
 			// Do nothing
 		}
 	}
+	DPrintf("[%v] stop ApplyMsgDispatch", kv.me)
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -133,17 +123,17 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	logCommand.OpType = OP_GET
 	logCommand.OpKey = args.Key
 
-	kv.mu.Lock()
 	logIndex, _, isLeader := kv.rf.Start(logCommand)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
 	// Register rpcChannel for current RPC handler
+	kv.mu.Lock()
 	ch := make(chan string)
 	kv.rpcChans[logIndex] = ch
 	kv.mu.Unlock()
-
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		goto unregister_and_return
-	}
 
 	// Wait for operation log apply
 	select {
@@ -154,7 +144,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 	DPrintf("[%v] Get, args: %+v, reply: %+v", kv.me, args, reply)
 
-unregister_and_return:
+	// Unregister rpcChannel
 	kv.mu.Lock()
 	delete(kv.rpcChans, logIndex)
 	kv.mu.Unlock()
@@ -184,13 +174,16 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.mu.Unlock()
 		return
 	}
+	kv.mu.Unlock()
+
 	logIndex, _, isLeader := kv.rf.Start(logCommand)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		kv.mu.Unlock()
 		return
 	}
+
 	// Register rpcChannel for current RPC handler
+	kv.mu.Lock()
 	ch := make(chan string)
 	kv.rpcChans[logIndex] = ch
 	kv.mu.Unlock()
@@ -204,6 +197,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	DPrintf("[%v] PutAppend, args: %+v, reply: %+v", kv.me, args, reply)
 
+	// Unregister rpcChannel
 	kv.mu.Lock()
 	delete(kv.rpcChans, logIndex)
 	kv.mu.Unlock()

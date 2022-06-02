@@ -2,7 +2,7 @@
 
 test_name=$1
 epoch=$2
-timeout=60
+timeout=360
 output="test_log"
 
 echo "run test ${test_name} for epoch ${epoch}, timeout ${timeout} s"
