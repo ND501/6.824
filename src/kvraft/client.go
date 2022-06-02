@@ -46,7 +46,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	args := GetArgs{key, ck.clientId, ck.cmdseq}
-	DPrintf("[%v] try to PutAppend %+v", ck.clientId, args)
+	DPrintf("[%v] try to Get %+v", ck.clientId, args)
 	for {
 		reply := GetReply{}
 		ok := ck.servers[ck.leaderId].Call("KVServer.Get", &args, &reply)
@@ -55,7 +55,10 @@ func (ck *Clerk) Get(key string) string {
 			continue
 		}
 		ck.cmdseq++
-		DPrintf("[%v] Get successed with %v", ck.clientId, reply.Value)
+		DPrintf(
+			"[%v] Get successed with Err %v {key:%v, value:%v}",
+			reply.Err, ck.clientId, key, reply.Value,
+		)
 		return reply.Value
 	}
 }
@@ -82,7 +85,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			continue
 		}
 		ck.cmdseq++
-		DPrintf("[%v] PutAppend successed", ck.clientId)
+		DPrintf("[%v] PutAppend successed with Err %v", ck.clientId, reply.Err)
 		return
 	}
 }

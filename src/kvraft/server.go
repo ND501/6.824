@@ -28,6 +28,11 @@ const (
 	OP_APPEND int = 3
 )
 
+type OpResult struct {
+	res string
+	err Err
+}
+
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
@@ -52,13 +57,13 @@ type KVServer struct {
 	kvMap map[string]string
 
 	replyMap    map[int]int
-	rpcChans    map[int]chan string
+	rpcChans    map[int]chan OpResult
 	lastApplied int
 }
 
 func (kv *KVServer) ApplyMsgDispatch() {
 	DPrintf("[%v] start ApplyMsgDispatch", kv.me)
-	var getStr string
+	var toReply OpResult
 	for !kv.killed() {
 		select {
 		case msg := <-kv.applyCh:
@@ -78,7 +83,12 @@ func (kv *KVServer) ApplyMsgDispatch() {
 				)
 				// Handle applied log
 				if cmd.OpType == OP_GET {
-					getStr = kv.kvMap[cmd.OpKey]
+					if value, ok := kv.kvMap[cmd.OpKey]; ok {
+						toReply = OpResult{value, OK}
+					} else {
+						toReply = OpResult{"", ErrNoKey}
+					}
+					DPrintf("[%v] Get {key:%v} with {value:%v}", kv.me, cmd.OpKey, toReply.res)
 				} else {
 					if !kv.isRetransmitRPC(cmd.ClientId, cmd.CmdSeq) {
 						// Save clientId and sequence number
@@ -87,15 +97,19 @@ func (kv *KVServer) ApplyMsgDispatch() {
 						_, ok := kv.kvMap[cmd.OpKey]
 						if cmd.OpType == OP_PUT || !ok {
 							kv.kvMap[cmd.OpKey] = cmd.OpValue
+							DPrintf("[%v] Put {key:%v, value:%v}", kv.me, cmd.OpKey, cmd.OpValue)
 						} else {
 							kv.kvMap[cmd.OpKey] += cmd.OpValue
+							DPrintf("[%v] Append {key:%v, value:%v}", kv.me, cmd.OpKey, cmd.OpValue)
 						}
 					}
+					toReply = OpResult{"", OK}
 				}
 				// Notify RPC goroutine
 				ch, ok := kv.rpcChans[msg.CommandIndex]
-				if ok {
-					go func(str string) { ch <- str }(getStr)
+				if currentTerm, isLeader := kv.rf.GetState(); isLeader &&
+					msg.CommandTerm == currentTerm && ok {
+					go func(toReply OpResult) { ch <- toReply }(toReply)
 				}
 				kv.mu.Unlock()
 			} else if msg.SnapshotValid {
@@ -131,14 +145,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	// Register rpcChannel for current RPC handler
 	kv.mu.Lock()
-	ch := make(chan string)
+	ch := make(chan OpResult)
 	kv.rpcChans[logIndex] = ch
 	kv.mu.Unlock()
 
 	// Wait for operation log apply
 	select {
-	case reply.Value = <-ch:
-		reply.Err = OK
+	case ret := <-ch:
+		reply.Value = ret.res
+		reply.Err = ret.err
 	case <-time.After(EXECUTE_TIMEOUT):
 		reply.Err = ErrTimeout
 	}
@@ -184,7 +199,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	// Register rpcChannel for current RPC handler
 	kv.mu.Lock()
-	ch := make(chan string)
+	ch := make(chan OpResult)
 	kv.rpcChans[logIndex] = ch
 	kv.mu.Unlock()
 
@@ -250,7 +265,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.kvMap = make(map[string]string)
 	kv.replyMap = make(map[int]int)
-	kv.rpcChans = make(map[int]chan string)
+	kv.rpcChans = make(map[int]chan OpResult)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
